@@ -1,0 +1,6 @@
+#ifndef STUB_POWER_H
+#define STUB_POWER_H
+#define SCE_KERNEL_POWER_TICK_DEFAULT 0
+#define SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND 1
+int sceKernelPowerTick(int);
+#endif

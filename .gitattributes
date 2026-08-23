@@ -1,0 +1,20 @@
+# Force LF for everything text, regardless of the platform committing it.
+#
+# Git for Windows converts LF to CRLF on checkout by default. A shell script
+# or Python file committed with CRLF fails on Linux with a confusing
+# "bad interpreter" or syntax error, and the server side of this project
+# runs on Linux.
+* text=auto eol=lf
+
+*.c    text eol=lf
+*.h    text eol=lf
+*.py   text eol=lf
+*.sh   text eol=lf
+*.md   text eol=lf
+Makefile text eol=lf
+
+# Never touch these -- byte-for-byte or not at all.
+*.vpk  binary
+*.bin  binary
+*.png  binary
+*.jpg  binary

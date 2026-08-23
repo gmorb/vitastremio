@@ -1,0 +1,21 @@
+name: tests
+
+on: [push, pull_request]
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3
+
+      # The Vita sources cannot be built without vitasdk, so CI type-checks
+      # them against stub headers and runs the logic that is testable on a
+      # host: the Annex-B splitter, the address parser and the ring buffer.
+      - name: Run host tests
+        run: make -C test
+
+      - name: Check middleware parses
+        run: python3 -c "import ast; ast.parse(open('server/middleware.py').read())"
