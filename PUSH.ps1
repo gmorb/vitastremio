@@ -16,7 +16,14 @@ param(
     [string]$Name = "vitastremio"
 )
 
-$ErrorActionPreference = "Stop"
+# Continue, not Stop.
+#
+# PowerShell turns anything a native command writes to stderr into an error
+# record, and with Stop that terminates the script. git writes perfectly
+# normal progress and status messages to stderr -- "No such remote" on a
+# first run, for one -- so Stop makes routine output fatal. Exit codes are
+# checked explicitly instead, which is what actually indicates failure.
+$ErrorActionPreference = "Continue"
 Set-Location -Path $PSScriptRoot
 
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
@@ -61,16 +68,39 @@ if (-not (Test-Path .git)) { git init -q }
 git config core.autocrlf false
 
 git add .
-git commit -q -m "vitastremio v1.0 beta" 2>$null
-if ($LASTEXITCODE -ne 0) { Write-Host "   nothing new to commit" }
+
+# Only commit when something is actually staged; committing nothing is an
+# error, and on a re-run there may be nothing.
+git diff --cached --quiet
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "   nothing new to commit"
+} else {
+    git commit -q -m "vitastremio v1.0 beta"
+    if ($LASTEXITCODE -ne 0) { Write-Host "commit failed" -ForegroundColor Red; exit 1 }
+}
 
 git branch -M main
-git remote remove origin 2>$null | Out-Null
+
+# Test for the remote rather than removing it blindly: on a first run there
+# is none, and git says so on stderr.
+$remotes = @(git remote)
+if ($remotes -contains "origin") { git remote remove origin }
 git remote add origin "https://github.com/$User/$Name.git"
+
 git push -u origin main
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "Push failed. Common causes:" -ForegroundColor Red
+    Write-Host "  - the repository does not exist yet on github.com"
+    Write-Host "  - it was created with a README, so it has commits already"
+    Write-Host "    (fix: git pull --rebase origin main, then re-run)"
+    Write-Host "  - the username '$User' is wrong"
+    exit 1
+}
 
 git tag -f v1.0-beta -m "v1.0 beta" | Out-Null
 git push -f origin v1.0-beta
+if ($LASTEXITCODE -ne 0) { Write-Host "   tag push failed (not fatal)" }
 
 Write-Host ""
 Write-Host "Done: https://github.com/$User/$Name" -ForegroundColor Green
