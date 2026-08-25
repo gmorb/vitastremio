@@ -63,7 +63,7 @@ and so do addons that host their own content — then no torrents are involved
 and the Stremio server would sit there doing nothing.
 
 You can always add it later if you run into an addon that needs it. See
-[Addons only, without a Stremio server](#addons-only-without-a-stremio-server).
+[Watching without a Stremio server](#watching-without-a-stremio-server).
 
 ---
 
@@ -78,7 +78,7 @@ You can always add it later if you run into an addon that needs it. See
 - Subtitles, from your Stremio subtitle addons
 - Choose the audio track on releases that have more than one
 - Touch and button controls, seek bar, pause, skip 30 seconds
-- Audio sync adjustment if a source needs it — see [the trim menu](#the-trim-menu)
+- Audio sync adjustment if a source needs it — see [fixing out-of-sync audio](#fixing-out-of-sync-audio)
 - Change which computer it connects to from the Vita itself, so it works
   away from home too
 - Add and manage addons from a web page, on any device
@@ -184,7 +184,7 @@ sign in with a Stremio account key to bring across the ones you already have.
 
 Your addons decide what you can actually watch, so this step matters. Most
 work straight away; the ones that don't are covered in
-[Addons only, without a Stremio server](#addons-only-without-a-stremio-server).
+[Watching without a Stremio server](#watching-without-a-stremio-server).
 
 ### 3. Install the app on the Vita
 
