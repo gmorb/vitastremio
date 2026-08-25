@@ -6,9 +6,10 @@ A native PlayStation Vita client for Stremio, backed by a small companion
 service (`middleware.py`) that does everything the Vita cannot. No Stremio
 server required — addons are enough on their own.
 
-Browse your Stremio catalogs, search, pick a source, and watch — on a
-handheld from 2011, with hardware-decoded video, working audio, subtitles,
-audio track selection and touch controls.
+Browse your Stremio catalogs — movies and TV series — search, filter by
+genre, pick an episode and a source, and watch: on a handheld from 2011,
+with hardware-decoded video, working audio, subtitles, audio track selection
+and touch controls.
 
 ![status](https://img.shields.io/badge/status-beta-orange)
 ![platform](https://img.shields.io/badge/platform-PS%20Vita-blue)
@@ -59,8 +60,7 @@ before anything can play them. That is the one job it does.
 
 If your addons give back normal links — anything using a debrid service does,
 and so do addons that host their own content — then no torrents are involved
-and the Stremio server would sit there doing nothing. The setup page will show
-it as *not in use*. That's correct, not a problem to fix.
+and the Stremio server would sit there doing nothing.
 
 You can always add it later if you run into an addon that needs it. See
 [Addons only, without a Stremio server](#addons-only-without-a-stremio-server).
@@ -70,6 +70,9 @@ You can always add it later if you run into an addon that needs it. See
 ## Features
 
 - Browse and search your Stremio catalogs
+- Movies and TV series, with an episode picker for shows
+- Switch between movies and series and filter by genre — press TRIANGLE
+  on the catalog
 - Pick from a list of sources, with resolution, size and language shown
 - Smooth full-screen video with proper audio
 - Subtitles, from your Stremio subtitle addons
@@ -180,12 +183,13 @@ work straight away; the ones that don't are covered in
 
 ### 3. Install the app on the Vita
 
-Copy `release/vitastremio-v1.0-beta.vpk` to your Vita and install it with
-VitaShell. Open it, and it will ask for the address of the computer you set up
-in step 1. Enter it once and it remembers.
+Download `vitastremio.vpk` from the
+[latest release](https://github.com/gmorb/vitastremio/releases/latest),
+copy it to your Vita and install it with VitaShell. Open it, and it will ask
+for the address of the computer you set up in step 1. Enter it once and it
+remembers.
 
-That's everything. More detail if you need it:
-[docs/SERVER.md](docs/SERVER.md) and [docs/BUILD.md](docs/BUILD.md).
+That's everything. More detail if you need it: [BUILD.md](BUILD.md).
 
 ---
 
@@ -256,9 +260,6 @@ Stremio server does. Normal links skip it entirely.
 
 Nothing. There's no setting to change. Add your addons and go — if none of
 them use torrents, the Stremio server never comes into it.
-
-The setup page will show the Stremio server as **not in use**. That's the
-expected state, not something to fix.
 
 **One thing to watch for:** the Vita can't tell the two kinds of source apart,
 so torrent sources still appear in the list and simply fail if you pick one.
@@ -348,7 +349,7 @@ speed wherever you happen to be. Home connections usually have far less
 upload than download, so look up that number specifically. Below about
 5 Mbit up, expect stuttering.
 
-If it is borderline, lower the video bitrate. In `server/middleware.py` near
+If it is borderline, lower the video bitrate. In `middleware.py` near
 the top, change `VID_BITRATE` and `VID_MAXRATE` to something like `1200k`
 and `1500k`. The picture is softer, but it holds together on a weaker
 connection.
@@ -398,12 +399,16 @@ cover it.
 ### Repository layout
 
 ```
-src/          Vita client (C, vitasdk + vita2d)
-server/       middleware.py -- the whole server side, stdlib only
-test/         host-side tests; no Vita toolchain needed
-docs/         setup and build guides
-release/      prebuilt .vpk
+src/            Vita client (C, vitasdk + vita2d)
+middleware.py   the whole server side, stdlib only
+CMakeLists.txt  Vita build definition
+build.sh        one-step VPK build
+BUILD.md        build guide
+CHANGELOG.md    release history
 ```
+
+Prebuilt `.vpk` files are attached to
+[GitHub Releases](https://github.com/gmorb/vitastremio/releases).
 
 | File | Purpose |
 |---|---|
@@ -416,20 +421,6 @@ release/      prebuilt .vpk
 | `config.h` | server address parsing and persistence |
 | `ime.h` | on-screen keyboard |
 | `log.h` | file logger |
-
-### Tests
-
-The Vita sources cannot be compiled without vitasdk, so the parts that are
-pure data handling are testable on any Linux box — along with a type-check
-of the real sources against stub headers:
-
-```bash
-cd test && make
-```
-
-This covers declaration order, a full compile of `main.c` and `player.c`,
-the Annex-B splitter, the address parser, and the ring buffer under
-ThreadSanitizer. Run it before opening a PR.
 
 ---
 
