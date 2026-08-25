@@ -169,6 +169,11 @@ Either pick a lower-quality source, or tell it to prioritise speed:
 X264_PRESET=ultrafast python3 middleware.py
 ```
 
+It normally picks the best encoder by itself, but you can force one with
+`VITA_ENCODER=vaapi`, `VITA_ENCODER=videotoolbox` or `VITA_ENCODER=x264` —
+handy for checking how the software path behaves on a machine that has a
+working GPU encoder.
+
 ### 2. Add your addons
 
 On any computer or phone, open a browser and go to

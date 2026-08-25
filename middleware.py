@@ -42,6 +42,27 @@ STREMIO = os.environ.get("STREMIO_URL", "http://127.0.0.1:11470")
 LISTEN_PORT = int(os.environ.get("VITA_PORT", "8480"))
 RENDER_NODE = os.environ.get("VAAPI_DEVICE", "/dev/dri/renderD128")
 
+# Video encoder. Empty means "probe at startup and pick the first that
+# works", which is what almost everyone wants. Set VITA_ENCODER to vaapi,
+# videotoolbox or x264 to force one -- useful for confirming the software
+# path on a machine that does have a working GPU encoder.
+#
+# The order below is deliberate: hardware first, software last. x264 is
+# always tried last because it always succeeds, so probing it earlier would
+# mask a GPU encoder that was one permissions fix away from working.
+ENCODER_ORDER = ("vaapi", "videotoolbox", "x264")
+ENCODER = os.environ.get("VITA_ENCODER", "").strip().lower() or None
+
+# Speed/quality dial for the software encoder. Slower presets look better but
+# have to keep up with playback in real time, so this errs fast.
+X264_PRESET = os.environ.get("X264_PRESET", "veryfast")
+
+ENCODER_LABEL = {
+    "vaapi": "hardware (Intel/AMD)",
+    "videotoolbox": "hardware (Apple)",
+    "x264": "software",
+}
+
 # Vita panel is 960x544. Never send more pixels than that.
 VID_W, VID_H = 960, 544
 VID_BITRATE = "2500k"
@@ -595,17 +616,17 @@ def render_config(msg="", err=""):
         stremio_state, stremio_pip = "connected", "ok"
     else:
         stremio_state, stremio_pip = "not in use", "warn"
-    if VAAPI_OK is None:
-        vaapi = ("not probed", "warn")
-    elif VAAPI_OK:
-        vaapi = ("hardware", "ok")
+    if ACTIVE_ENCODER is None:
+        enc = ("unavailable", "warn")
+    elif ACTIVE_ENCODER == "x264":
+        enc = ("software (CPU)", "warn")
     else:
-        vaapi = ("software (slow)", "warn")
+        enc = (ENCODER_LABEL.get(ACTIVE_ENCODER, ACTIVE_ENCODER), "ok")
 
     linked = bool(load_auth_key())
     health = "".join([
         stat("Stremio server", stremio_state, stremio_pip),
-        stat("Transcoding", vaapi[0], vaapi[1]),
+        stat("Transcoding", enc[0], enc[1]),
         stat("Stream sources",
              "ready" if has_stream else "none configured",
              "ok" if has_stream else "warn"),
@@ -834,45 +855,98 @@ def probe_stream(src):
         return 30, 1, 30000, duration
 
 
-def video_cmd(src, offset, fps=(30, 1)):
-    """VAAPI decode -> scale -> H.264 encode -> raw Annex-B on stdout.
+def scale_filter(hwupload):
+    """Fit the source into the Vita panel without stretching it.
+
+    The pad keeps the aspect ratio by letterboxing rather than distorting.
+    VAAPI needs the result uploaded to the GPU; the other encoders take
+    frames from system memory directly. Either way the pixel format is
+    pinned to 8-bit 4:2:0 -- the Vita decoder has no 10-bit path, and a
+    10-bit HEVC source would otherwise reach the encoder as p010.
+    """
+    chain = ("scale=%d:%d:force_original_aspect_ratio=decrease,"
+             "pad=%d:%d:(ow-iw)/2:(oh-ih)/2"
+             % (VID_W, VID_H, VID_W, VID_H))
+    return chain + (",format=nv12,hwupload" if hwupload else ",format=yuv420p")
+
+
+def encoder_args(name):
+    """Per-encoder flags, split into what goes before -i and what goes after.
+
+    Three constraints have to hold whichever encoder is used, because they
+    are what the Vita client assumes:
+
+      * Main profile, level 3.1 -- the ceiling of the hardware decoder.
+      * No B-frames. The client tags each decoded picture with the timestamp
+        of the access unit it just submitted, which is only valid when output
+        order matches input order. Reordering makes every timestamp wrong and
+        the frame scheduler paces against nonsense.
+      * At most 3 reference frames, matching REF_FRAMES in player.c. A larger
+        window needs a bigger phycont allocation on the Vita, which is the
+        allocation most likely to fail.
+
+    Each encoder spells those last two differently, which is the only reason
+    this is not one list.
+    """
+    if name == "vaapi":
+        return (["-vaapi_device", RENDER_NODE],
+                ["-c:v", "h264_vaapi",
+                 "-profile:v", "main",
+                 "-level", "31",          # VAAPI wants 31, not 3.1
+                 "-refs", "3",
+                 "-bf", "0"])
+
+    if name == "videotoolbox":
+        # macOS hardware encoder. B-frames are controlled by
+        # allow_frame_reordering rather than -bf, and the reference window by
+        # max_ref_frames; -bf and -refs are silently ignored here.
+        return ([],
+                ["-c:v", "h264_videotoolbox",
+                 "-profile:v", "main",
+                 "-level", "31",
+                 "-allow_frame_reordering", "0",
+                 "-max_ref_frames", "3",
+                 "-realtime", "1"])
+
+    # Software. Works anywhere ffmpeg does, including Windows and macOS, at
+    # the cost of real CPU. The preset is the speed/quality dial: veryfast
+    # keeps up with 1080p on a modern desktop core, ultrafast is the escape
+    # hatch for anything slower.
+    return ([],
+            ["-c:v", "libx264",
+             "-preset", X264_PRESET,
+             "-tune", "zerolatency",
+             "-profile:v", "main",
+             "-level", "31",
+             "-refs", "3",
+             "-bf", "0"])
+
+
+def video_cmd(src, offset, fps=(30, 1), encoder=None):
+    """decode -> scale -> H.264 encode -> raw Annex-B on stdout.
 
     -hwaccel_output_format is deliberately NOT set. Keeping frames in system
     memory costs a little bandwidth but survives 10-bit HEVC sources, which
-    otherwise trip scale_vaapi with a p010 format error. The encode is still
-    fully on the GPU, which is where the cost actually is.
+    otherwise trip scale_vaapi with a p010 format error. On VAAPI the encode
+    is still fully on the GPU, which is where the cost actually is.
     """
+    name = encoder or ACTIVE_ENCODER or ENCODER or "x264"
+    pre_enc, enc = encoder_args(name)
     pre, post = seek_args(offset)
     return [
         "ffmpeg", "-loglevel", "error", "-nostdin",
-        "-vaapi_device", RENDER_NODE,
-    ] + pre + [
+    ] + pre_enc + pre + [
         "-i", src,
     ] + post + [
         "-an",
-        "-vf", "scale=%d:%d:force_original_aspect_ratio=decrease,"
-               "pad=%d:%d:(ow-iw)/2:(oh-ih)/2,format=nv12,hwupload"
-               % (VID_W, VID_H, VID_W, VID_H),
-        "-c:v", "h264_vaapi",
-        "-profile:v", "main",
-        "-level", "31",            # VAAPI wants 31, not 3.1
+        "-vf", scale_filter(name == "vaapi"),
+    ] + enc + [
         # Constant frame rate is REQUIRED: the client derives presentation
         # time from a frame counter, so a variable rate would drift against
         # the audio clock. But the rate now MATCHES THE SOURCE rather than
         # being forced to 30 -- padding 23.976 film to 30 duplicates frames
         # unevenly and that cadence is visible as judder on any pan.
         "-vsync", "cfr", "-r", "%d/%d" % (fps[0], fps[1]),
-        # Pinned to match REF_FRAMES in player.c. A larger reference window
-        # would need a bigger phycont allocation on the Vita, which is the
-        # allocation most likely to fail.
-        "-refs", "3",
-        # No B-frames. The Vita client tags each decoded picture with the
-        # timestamp of the access unit it just submitted, which is only valid
-        # when output order matches input order. B-frames reorder, so every
-        # picture would carry the wrong timestamp and the frame scheduler
-        # would pace against nonsense -- jerky playback with all the pacing
-        # machinery working correctly. Also cuts decoder latency.
-        "-bf", "0",
         "-g", str(max(12, int(round(fps[0] / float(fps[1]) * 2)))),
         "-b:v", VID_BITRATE,
         "-maxrate", VID_MAXRATE,
@@ -1738,20 +1812,22 @@ class Handler(BaseHTTPRequestHandler):
         return pack(rows)
 
 
-def vaapi_probe():
-    """Confirm the GPU encoder actually works.
+def probe_encoder(name):
+    """Encode one second of test pattern to confirm this encoder works.
 
-    Must go through format=nv12,hwupload: h264_vaapi cannot accept frames
-    that live in system memory, so a probe without the upload step fails even
-    on a perfectly healthy machine and produces a false alarm.
+    Built from the same argument functions as real playback, so a probe can
+    never pass while playback fails on a flag the probe did not use. The
+    VAAPI case in particular must go through format=nv12,hwupload:
+    h264_vaapi cannot accept frames from system memory, so a probe without
+    the upload step fails on a perfectly healthy machine.
     """
-    cmd = [
+    pre_enc, enc = encoder_args(name)
+    cmd = ([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
-        "-vaapi_device", RENDER_NODE,
+    ] + pre_enc + [
         "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=30",
-        "-vf", "format=nv12,hwupload",
-        "-c:v", "h264_vaapi", "-f", "null", "-",
-    ]
+        "-vf", scale_filter(name == "vaapi"),
+    ] + enc + ["-f", "null", "-"])
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=25)
     except Exception as e:
@@ -1761,8 +1837,36 @@ def vaapi_probe():
     return False, r.stderr.decode("utf-8", "replace").strip()[-400:]
 
 
-VAAPI_OK = None
-VAAPI_WHY = ""
+def pick_encoder():
+    """Choose an encoder, honouring VITA_ENCODER if it is set.
+
+    Returns (name, why). A forced encoder that fails its probe is returned
+    anyway with the failure text: overriding the probe is an explicit choice,
+    and silently falling back would hide the mistake behind slow playback.
+    """
+    if ENCODER:
+        if ENCODER not in ENCODER_ORDER:
+            return None, ("VITA_ENCODER=%s is not one of: %s"
+                          % (ENCODER, ", ".join(ENCODER_ORDER)))
+        ok, why = probe_encoder(ENCODER)
+        if not ok:
+            print("!! VITA_ENCODER=%s was forced but its test encode failed."
+                  "\n!! Using it anyway. ffmpeg said:\n%s" % (ENCODER, why))
+        return ENCODER, why
+
+    failures = []
+    for name in ENCODER_ORDER:
+        ok, why = probe_encoder(name)
+        if ok:
+            return name, ""
+        failures.append("%s: %s" % (name, why.splitlines()[-1] if why else "?"))
+    return None, "\n".join(failures)
+
+
+# Resolved at startup by pick_encoder(). None means nothing worked, which
+# leaves the config page reachable so the failure can be read there.
+ACTIVE_ENCODER = None
+ENCODER_WHY = ""
 
 
 
@@ -1778,7 +1882,7 @@ def set_addon_shape(text):
 
 def stremio_reachable():
     try:
-        req = urllib.request.Request(STREMIO_URL + "/settings",
+        req = urllib.request.Request(STREMIO + "/settings",
                                      headers={"User-Agent": "vitastremio/1"})
         with urllib.request.urlopen(req, timeout=1.5):
             return True
@@ -1787,7 +1891,7 @@ def stremio_reachable():
 
 
 def main():
-    global ADDONS, VAAPI_OK, VAAPI_WHY
+    global ADDONS, ACTIVE_ENCODER, ENCODER_WHY
 
     if "--auth-key" in sys.argv:
         # Escape hatch: paste a key pulled from the Stremio web app instead
@@ -1814,14 +1918,20 @@ def main():
 
     ADDONS = resolve_addons()
 
-    ok, why = vaapi_probe()
-    VAAPI_OK, VAAPI_WHY = ok, why
-    if ok:
-        print("VAAPI encode OK on %s" % RENDER_NODE)
+    name, why = pick_encoder()
+    ACTIVE_ENCODER, ENCODER_WHY = name, why
+    if name == "vaapi":
+        print("[mw] encoding with VAAPI on %s" % RENDER_NODE)
+    elif name == "videotoolbox":
+        print("[mw] encoding with VideoToolbox")
+    elif name == "x264":
+        print("!! No hardware encoder found -- using software (x264, preset\n"
+              "!! %s). This works, but it uses a lot of CPU and may not keep\n"
+              "!! up with high bitrate sources. On Linux, `vainfo` and access\n"
+              "!! to /dev/dri are what to check." % X264_PRESET)
     else:
-        print("!! VAAPI encode FAILED on %s -- transcodes will fall back to\n"
-              "!! software and peg the CPU. Check `vainfo` and access to\n"
-              "!! /dev/dri. ffmpeg said:\n%s" % (RENDER_NODE, why))
+        print("!! No usable encoder. Playback will not work until this is\n"
+              "!! fixed. Is ffmpeg installed and on PATH? Tried:\n%s" % why)
 
     if load_auth_key():
         sync_from_account()

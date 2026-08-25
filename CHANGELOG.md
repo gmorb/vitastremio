@@ -15,6 +15,13 @@ All notable changes to vitastremio (PS Vita Stremio client + middleware).
 - Subtitles are fetched for the exact episode being played rather than the
   series entry.
 
+- Middleware: pluggable video encoder selection. Probes VAAPI (Intel/AMD),
+  VideoToolbox (Apple) and x264 in that order at startup and uses the first
+  that works; `VITA_ENCODER=vaapi|videotoolbox|x264` forces one, and
+  `X264_PRESET` tunes the software encoder (default `veryfast`).
+- Middleware: the config page transcoding indicator now names the active
+  encoder instead of only distinguishing hardware from software.
+
 ### Changed
 - Removed the Stremio server / account status indicators from the middleware
   config page.
