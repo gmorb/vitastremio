@@ -2,6 +2,13 @@
 
 All notable changes to vitastremio (PS Vita Stremio client + middleware).
 
+## [1.02-beta] - 2026-08-26
+
+### Added
+- VPK image assets: `icon0.png`, `bg0.png`, and `startup.png` bundled into the
+  VPK under `appicon/` so the PS Vita shows a proper icon, background, and
+  startup screen.
+
 ## [1.01-beta] - 2026-08-25
 
 ### Added
