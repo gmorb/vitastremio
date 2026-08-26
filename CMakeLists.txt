@@ -14,7 +14,7 @@ include("${VITASDK}/share/vita.cmake" REQUIRED)
 
 set(VITA_APP_NAME "vitastremio")
 set(VITA_TITLEID  "VSTR00001")
-set(VITA_VERSION  "01.02")
+set(VITA_VERSION  "01.03")
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O2 -std=gnu11")
 
@@ -64,5 +64,8 @@ vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME} UNSAFE)
 vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
   VERSION ${VITA_VERSION}
   NAME     ${VITA_APP_NAME}
-  FILE       ${CMAKE_SOURCE_DIR}/assets/icon0.png   icon0.png ${CMAKE_SOURCE_DIR}/assets/bg0.png   bg0.png ${CMAKE_SOURCE_DIR}/assets/startup.png   startup.png
+  FILE ${CMAKE_SOURCE_DIR}/assets/sce_sys/icon0.png                  sce_sys/icon0.png
+  FILE ${CMAKE_SOURCE_DIR}/assets/sce_sys/livearea/contents/bg0.png      sce_sys/livearea/contents/bg0.png
+  FILE ${CMAKE_SOURCE_DIR}/assets/sce_sys/livearea/contents/startup.png  sce_sys/livearea/contents/startup.png
+  FILE ${CMAKE_SOURCE_DIR}/assets/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
 )

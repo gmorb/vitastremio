@@ -2,12 +2,22 @@
 
 All notable changes to vitastremio (PS Vita Stremio client + middleware).
 
+## [1.03-beta] - 2026-08-26
+
+### Fixed
+- VPK LiveArea image structure: images are now placed under `sce_sys/` with
+  the correct PS Vita paths (`sce_sys/icon0.png`,
+  `sce_sys/livearea/contents/bg0.png`, `sce_sys/livearea/contents/startup.png`)
+  and a `template.xml` is included. Images are converted to 8-bit indexed
+  colour as required by the Vita firmware.
+
 ## [1.02-beta] - 2026-08-26
 
 ### Added
 - VPK image assets: `icon0.png`, `bg0.png`, and `startup.png` bundled into the
-  VPK under `appicon/` so the PS Vita shows a proper icon, background, and
-  startup screen.
+  VPK. **Superseded by 1.03-beta** — images were placed at the VPK root instead
+  of the required `sce_sys/` LiveArea structure, so they did not display on
+  device.
 
 ## [1.01-beta] - 2026-08-25
 
