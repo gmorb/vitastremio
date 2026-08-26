@@ -1,4 +1,6 @@
-<a href="https://www.buymeacoffee.com/Gmorb" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" style="height: 60px !important;width: 217px !important;" ></a>
+<p align="center">
+  <img src="assets/banner.png" alt="vitastremio" width="640">
+</p>
 
 # vitastremio
 
@@ -434,6 +436,7 @@ Prebuilt `.vpk` files are attached to
 Built with [vitasdk](https://vitasdk.org) and
 [vita2d](https://github.com/xerpi/libvita2d). Not affiliated with Stremio.
 
+<a href="https://www.buymeacoffee.com/Gmorb" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" height="45"></a>
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
