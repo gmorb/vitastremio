@@ -64,5 +64,5 @@ vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME} UNSAFE)
 vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
   VERSION ${VITA_VERSION}
   NAME     ${VITA_APP_NAME}
-  FILE      ${CMAKE_SOURCE_DIR}/assets/icon0.png   appicon/icon0.png ${CMAKE_SOURCE_DIR}/assets/bg0.png   appicon/bg0.png ${CMAKE_SOURCE_DIR}/assets/startup.png   appicon/startup.png
+  FILE       ${CMAKE_SOURCE_DIR}/assets/icon0.png   icon0.png ${CMAKE_SOURCE_DIR}/assets/bg0.png   bg0.png ${CMAKE_SOURCE_DIR}/assets/startup.png   startup.png
 )
