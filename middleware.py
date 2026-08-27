@@ -72,6 +72,50 @@ VID_MAXRATE = "3000k"
 # perfect audio clock and one less decoder on the Vita. Combined with
 # 2.5Mbit video this sits around 3.5Mbit -- within single-stream 2.4GHz
 # 802.11n on a good link, tight on a bad one. Drop to mono if you stall.
+# --- Downmix and loudness ------------------------------------------------
+#
+# ffmpeg's default 5.1 -> stereo downmix has two problems for a handheld.
+# Measured against test files with a tone in one channel at a time:
+#
+#   * lfe_mix_level defaults to 0, so the LFE channel is DISCARDED. A tone
+#     placed only in LFE came out at -91 dB -- silence. Every bass element
+#     authored to that track simply vanished.
+#   * The centre landed 3 dB BELOW the front pair, so dialogue sat under the
+#     music and effects rather than above them.
+#
+# CENTER_MIX 1.4 puts dialogue ~3 dB above the front pair instead, a 6 dB
+# swing where it matters. rematrix_maxval=1.0 is what stops ffmpeg scaling
+# the whole matrix down again to guarantee headroom it does not need.
+CENTER_MIX = float(os.environ.get("CENTER_MIX_LEVEL", "1.4"))
+LFE_MIX    = float(os.environ.get("LFE_MIX_LEVEL", "0.5"))
+
+# The downmix also costs ~10 dB of loudness: a 5.1 source measured at
+# -27.0 LUFS arrived at -37.4, while a stereo source passed through at
+# unity. That is the whole reason surround streams sound quiet. This gain
+# restores parity and goes no further -- it is not a loudness boost, it is
+# putting back exactly what the matrix took. Applied ONLY when downmixing.
+DOWNMIX_GAIN_DB = float(os.environ.get("DOWNMIX_GAIN_DB", "8"))
+
+# Optional extra gain, off by default, requested per-stream by the client.
+# For headphones and Bluetooth, where the Vita's speakers are not the limit
+# and film mastered at -24 LUFS is simply too quiet. Clamped, because the
+# point is to reach the intended loudness, not to exceed it.
+BOOST_GAIN_DB = min(12.0, max(0.0, float(os.environ.get("BOOST_GAIN_DB", "6"))))
+
+# The clipping guard, and it is ALWAYS in the chain.
+#
+# alimiter's latency equals its attack exactly -- measured by passing an
+# impulse through it -- so leaving it always on keeps that latency constant
+# whether or not any gain is applied. A limiter that came and went with the
+# boost toggle would shift A/V sync by its attack every time it was flipped.
+#
+# attack=20 and limit=0.89 were chosen by measurement, not taste: at
+# attack=5:limit=0.95 a hostile source still produced 10 clipped samples at
+# +12 dB and 32 at +20 dB. These settings gave ZERO clipped samples at every
+# gain tested up to +20 dB, with true peak held at -0.4 dBFS.
+LIMIT_PEAK      = 0.89
+LIMIT_ATTACK_MS = 20
+
 AUD_RATE = 32000
 AUD_CH = 2
 
@@ -98,6 +142,101 @@ FALLBACK_ADDONS = ["https://v3-cinemeta.strem.io/manifest.json"]
 # restart without anyone editing the source or exporting a variable.
 ADDONS_PATH = os.path.expanduser(
     os.environ.get("VITA_ADDONS_FILE", "~/.vitastremio_addons.json"))
+
+
+# ---------------------------------------------------------------- resume
+#
+# Watch positions, so a title picked up later starts where it stopped.
+#
+# Keyed on the CONTENT id (tt0111161, or tt0903747:2:5 for an episode), not
+# on the stream key: the stream key encodes a particular source URL, so
+# resuming would break the moment a different source was chosen for the same
+# episode -- which is exactly what happens when a debrid link expires.
+PROGRESS_PATH = os.path.expanduser(
+    os.environ.get("VITA_PROGRESS_FILE", "~/.vitastremio_progress.json"))
+
+# Below this, nothing worth resuming -- the viewer barely started.
+PROGRESS_MIN_S = 60
+# Past this fraction, treat it as finished and start clean next time.
+PROGRESS_DONE_FRAC = 0.95
+PROGRESS_MAX_ENTRIES = 500
+
+_progress      = None
+_progress_lock = threading.Lock()
+_progress_dirty = 0.0
+
+
+def load_progress():
+    global _progress
+    if _progress is None:
+        try:
+            with open(PROGRESS_PATH) as f:
+                _progress = json.load(f).get("progress", {})
+        except Exception:
+            _progress = {}
+    return _progress
+
+
+def save_progress_now():
+    """Write the store out. Atomic, like the addons file."""
+    with _progress_lock:
+        data = dict(load_progress())
+    # Bound the file. Oldest by last-updated goes first.
+    if len(data) > PROGRESS_MAX_ENTRIES:
+        ordered = sorted(data.items(), key=lambda kv: kv[1].get("at", 0))
+        data = dict(ordered[-PROGRESS_MAX_ENTRIES:])
+    tmp = PROGRESS_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump({"progress": data}, f)
+        os.replace(tmp, PROGRESS_PATH)
+    except Exception as e:
+        print("[mw] could not save progress (%s)" % e)
+
+
+def record_progress(cid, seconds, duration=0):
+    """Note where a title has been watched to.
+
+    Called from the audio stream as it serves, so it costs nothing extra and
+    stays accurate through pauses: the audio is CBR PCM, so bytes served
+    divide exactly into seconds of playback. Wall-clock timing would count
+    time spent paused, when the client stops reading and ffmpeg blocks on
+    the socket.
+    """
+    global _progress_dirty
+    if not cid:
+        return
+    with _progress_lock:
+        store = load_progress()
+        prev  = store.get(cid, {})
+        store[cid] = {
+            "t":  int(seconds),
+            "d":  int(duration or prev.get("d", 0)),
+            "at": int(time.time()),
+        }
+        due = (time.time() - _progress_dirty) > 10
+        if due:
+            _progress_dirty = time.time()
+    # Written outside the lock, and only every 10s -- this is called once
+    # per streamed chunk and the file is not worth touching that often.
+    # 10s also bounds how much can be lost to a power-off: the resume point
+    # lands at most that far back, which is a rewind rather than a loss.
+    if due:
+        save_progress_now()
+
+
+def get_progress(cid):
+    """Seconds to resume at, or 0 for start-from-the-beginning."""
+    with _progress_lock:
+        e = load_progress().get(cid or "")
+    if not e:
+        return 0
+    t, d = e.get("t", 0), e.get("d", 0)
+    if t < PROGRESS_MIN_S:
+        return 0
+    if d and t > d * PROGRESS_DONE_FRAC:
+        return 0            # finished; next time starts clean
+    return t
 
 
 def normalize_manifest(url):
@@ -746,6 +885,31 @@ def key_decode(key):
 SEEK_PREROLL = 8.0
 
 
+def input_args(src):
+    """Options that must precede -i, for remote sources.
+
+    Without these a network hiccup on the source is silent and open-ended:
+    ffmpeg's HTTP reader blocks and the transcode simply stops producing.
+    The Vita sees nothing arriving, spends its 20s receive timeout waiting,
+    and logs "stalled, retrying" -- by which point its rings are empty, the
+    audio has underrun and the video is seconds behind.
+
+    reconnect makes ffmpeg re-establish the connection rather than wait
+    forever; rw_timeout bounds a single blocked read so a dead connection is
+    noticed in seconds rather than never. Both apply only to http(s), where
+    ffmpeg accepts them -- passing them to a local file input is an error.
+    """
+    if not str(src).lower().startswith(("http://", "https://")):
+        return []
+    return [
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_on_network_error", "1",
+        "-reconnect_delay_max", "5",
+        "-rw_timeout", "15000000",       # 15s, in microseconds
+    ]
+
+
 def seek_args(offset):
     """Split a seek into a coarse input seek and a fine output seek.
 
@@ -935,7 +1099,7 @@ def video_cmd(src, offset, fps=(30, 1), encoder=None):
     pre, post = seek_args(offset)
     return [
         "ffmpeg", "-loglevel", "error", "-nostdin",
-    ] + pre_enc + pre + [
+    ] + pre_enc + input_args(src) + pre + [
         "-i", src,
     ] + post + [
         "-an",
@@ -956,11 +1120,73 @@ def video_cmd(src, offset, fps=(30, 1), encoder=None):
     ]
 
 
-def audio_cmd(src, offset, track=-1):
+_chan_cache = {}
+_chan_lock  = threading.Lock()
+
+
+def audio_channels(src, track):
+    """Channel count for the track about to be played, cached per source.
+
+    The downmix makeup gain must NOT be applied to a stereo source -- that
+    path already arrives at unity, so gain there would be a loudness boost
+    nobody asked for. So the count has to be known before the filter chain
+    is built.
+
+    probe_audio_tracks already reads this, and /audiotracks has usually run
+    before playback starts, so the cache normally makes this free. When it
+    misses, one probe costs a second on a remote source, once per title.
+    """
+    with _chan_lock:
+        hit = _chan_cache.get(src)
+    if hit is None:
+        hit = {n: ch for n, _, _, ch, _ in probe_audio_tracks(src)}
+        with _chan_lock:
+            if len(_chan_cache) > 128:      # bounded; titles are transient
+                _chan_cache.clear()
+            _chan_cache[src] = hit
+    if not hit:
+        return 0
+    if track >= 0:
+        return hit.get(track, 0)
+    # Default track: the file's first audio stream.
+    return hit.get(min(hit), 0)
+
+
+def audio_filters(channels, boost):
+    """Build the -af chain. See the constants above for why each part exists.
+
+    Order matters: rematrix first (that is where the loss happens), then
+    makeup, then the limiter last so it sees the final level.
+    """
+    parts = []
+    gain  = 0.0
+
+    if channels > 2:
+        parts.append("aresample=async=1:center_mix_level=%.3f"
+                     ":lfe_mix_level=%.3f:rematrix_maxval=1.0"
+                     % (CENTER_MIX, LFE_MIX))
+        gain += DOWNMIX_GAIN_DB
+    else:
+        # Stereo and mono measured transparent through this path -- 0.5 dB,
+        # which is just the 48k -> 32k resample. Nothing to correct.
+        parts.append("aresample=async=1")
+
+    if boost:
+        gain += BOOST_GAIN_DB
+    if gain > 0.01:
+        parts.append("volume=%.2fdB" % gain)
+
+    parts.append("alimiter=limit=%.2f:attack=%d:release=100:level=disabled"
+                 % (LIMIT_PEAK, LIMIT_ATTACK_MS))
+    return ",".join(parts)
+
+
+def audio_cmd(src, offset, track=-1, boost=0):
     pre, post = seek_args(offset)
+    channels = audio_channels(src, track)
     return [
         "ffmpeg", "-loglevel", "error", "-nostdin",
-    ] + pre + [
+    ] + input_args(src) + pre + [
         "-i", src,
     ] + post + (
         # With an explicit map, selection is already unambiguous, so -vn is
@@ -970,7 +1196,7 @@ def audio_cmd(src, offset, track=-1):
         # the stream dying outright.
         ["-map", "0:a:%d?" % track] if track >= 0 else ["-vn"]
     ) + [
-        "-af", "aresample=async=1",
+        "-af", audio_filters(channels, boost),
         "-c:a", "pcm_s16le",
         "-ar", str(AUD_RATE),
         "-ac", str(AUD_CH),
@@ -978,7 +1204,8 @@ def audio_cmd(src, offset, track=-1):
     ]
 
 
-def stream_process(handler, cmd, content_type, fps_milli=0, duration=0):
+def stream_process(handler, cmd, content_type, fps_milli=0, duration=0,
+                   progress_id=None, progress_base=0):
     handler.send_response(200)
     handler.send_header("Content-Type", content_type)
     if fps_milli:
@@ -1023,6 +1250,12 @@ def stream_process(handler, cmd, content_type, fps_milli=0, duration=0):
             chunk = proc.stdout.read(32768)
             if not chunk:
                 break
+            if progress_id:
+                # Exact, and immune to pausing: PCM at AUD_RATE x AUD_CH x
+                # 2 bytes is constant, so bytes served IS elapsed playback.
+                record_progress(progress_id,
+                                progress_base + sent / float(AUD_RATE * AUD_CH * 2),
+                                duration)
             handler.wfile.write(chunk)
             sent += len(chunk)
     except (BrokenPipeError, ConnectionResetError):
@@ -1285,8 +1518,13 @@ class Handler(BaseHTTPRequestHandler):
                     track = -1
                 if track >= 0:
                     self.log_message("audio track %d requested", track)
-                stream_process(self, audio_cmd(src, one("t", "0"), track),
-                               "audio/L16")
+                # id is optional: playback works without it, only resume
+                # depends on it, so an older client simply gets no resume.
+                stream_process(self, audio_cmd(src, one("t", "0"), track,
+                                               boost=one("b") == "1"),
+                               "audio/L16",
+                               progress_id=one("id"),
+                               progress_base=int(one("t", "0") or 0))
             elif parsed.path in ("/", "/config"):
                 self._send(render_config(one("msg"), one("err")),
                            "text/html; charset=utf-8")
@@ -1297,6 +1535,22 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(b"nosync\n")
                 else:
                     self._send(("ok %d\n" % len(urls)).encode())
+            elif parsed.path == "/progress":
+                # GET for both read and write, so the Vita's minimal HTTP
+                # client can use it -- same reasoning as /sync.
+                cid = one("id")
+                if one("t") != "":
+                    record_progress(cid, int(float(one("t", "0") or 0)),
+                                    int(float(one("d", "0") or 0)))
+                    save_progress_now()     # explicit write: end of playback
+                    self._send(b"ok\n")
+                elif one("clear") == "1":
+                    with _progress_lock:
+                        load_progress().pop(cid, None)
+                    save_progress_now()
+                    self._send(b"ok\n")
+                else:
+                    self._send(("%d\n" % get_progress(cid)).encode())
             elif parsed.path == "/ping":
                 # Include the pid so the Vita can tell a restarted middleware
                 # from a still-running one and drop stale assumptions.

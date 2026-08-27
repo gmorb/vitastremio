@@ -2,56 +2,69 @@
 
 All notable changes to vitastremio (PS Vita Stremio client + middleware).
 
-## [1.03-beta] - 2026-08-26
+## [1.1] - 2026-08-27
+
+A stability release. Most of this is about playback holding together when
+the connection wobbles.
 
 ### Fixed
-- VPK LiveArea image structure: images are now placed under `sce_sys/` with
-  the correct PS Vita paths (`sce_sys/icon0.png`,
-  `sce_sys/livearea/contents/bg0.png`, `sce_sys/livearea/contents/startup.png`)
-  and a `template.xml` is included. Images are converted to 8-bit indexed
-  colour as required by the Vita firmware.
 
-## [1.02-beta] - 2026-08-26
+**Video freezing while the sound kept playing.** The picture would lock up,
+audio carried on, and pausing did nothing -- the only way out was seeking or
+restarting the stream. This had two separate causes and both are fixed, with
+a safety net behind them that recovers within a quarter of a second no matter
+what causes it.
 
-### Added
-- VPK image assets: `icon0.png`, `bg0.png`, and `startup.png` bundled into the
-  VPK. **Superseded by 1.03-beta** — images were placed at the VPK root instead
-  of the required `sce_sys/` LiveArea structure, so they did not display on
-  device.
+**Sound and picture drifting apart after buffering.** A short stall left them
+out of step and a longer one left them drifting further and further apart,
+with no way back short of restarting. Playback now holds still while it waits
+for the connection, so it comes back in step by itself. If a gap does open,
+it closes in about a second instead of a minute or not at all.
 
-## [1.01-beta] - 2026-08-25
+**Missing bass on surround soundtracks.** On 5.1 sources the low-frequency
+channel was being dropped entirely, so anything mixed into it just wasn't
+there.
 
-### Added
-- **TV series support**: selecting a series opens a new episode picker screen
-  (up to 400 episodes, `S1 E1`-style badges, touch + D-pad, L/R paging),
-  backed by the middleware `/meta` endpoint.
-- **Browse overlay** (TRIANGLE on the catalog): Movies / Series tabs plus a
-  genre list (Action, Comedy, Sci-Fi, Horror, and 15 more). Selection reloads
-  the catalog filtered by type and genre; the header shows the active mode.
-- Search now respects the active content type (movies or series).
-- Subtitles are fetched for the exact episode being played rather than the
-  series entry.
+**Dialogue buried under the music and effects.** Also on 5.1 sources, speech
+came through quieter than everything around it. It now sits above the rest of
+the mix.
 
-- Middleware: pluggable video encoder selection. Probes VAAPI (Intel/AMD),
-  VideoToolbox (Apple) and x264 in that order at startup and uses the first
-  that works; `VITA_ENCODER=vaapi|videotoolbox|x264` forces one, and
-  `X264_PRESET` tunes the software encoder (default `veryfast`).
-- Middleware: the config page transcoding indicator now names the active
-  encoder instead of only distinguishing hardware from software.
+**Surround films much quieter than stereo ones.** 5.1 soundtracks played
+noticeably quieter than stereo. They are now at matching levels. Stereo and
+mono are unchanged -- they were already correct.
 
-### Changed
-- Removed the Stremio server / account status indicators from the middleware
-  config page.
+**Brief flash of garbage when starting a stream.** A frame of the previous
+film, or of nothing in particular, could appear for an instant before
+playback began.
 
-## [1.00-beta] - earlier development
+**Dropouts on flaky sources.** If a source stopped responding mid-stream the
+server would wait indefinitely rather than reconnecting. It now retries.
 
 ### Added
-- Runtime server address configuration on the device (START opens an
-  ip:port dialog, persisted to `ux0:data/vitastremio.cfg`) -- no rebuild
-  needed to change servers.
-- On-screen keyboard (SceIme) for address entry and catalog search.
-- Hardware-accelerated AVC playback with A/V sync, seek, pause, audio track
-  and subtitle selection, auto-hiding touch transport bar.
-- Poster grid catalog with lazy artwork loading and off-screen eviction.
-- Python middleware translating Stremio addon JSON into a compact line
-  protocol, with transcode support and stream label parsing.
+
+**Resume where you left off.** Stop something, come back later, and it picks
+up where you stopped. Works even if you choose a different source for the
+same episode. Anything under a minute is ignored, and titles you've nearly
+finished start fresh.
+
+**A buffering spinner.** When playback pauses to let the connection catch up,
+you can now see that's what's happening rather than wondering if it has
+frozen.
+
+**A volume boost for headphones.** Films are mixed for cinemas and are often
+too quiet on a handheld. With headphones or Bluetooth, this adds extra
+volume. Open the overlay with SELECT+TRIANGLE and press SQUARE.
+
+### Notes
+
+- Volume is protected against distortion throughout, including with the
+  headphone boost on.
+- Correcting a large sync gap is now a visible jump rather than a slow slide.
+  That is deliberate -- it is over in an instant instead of taking a minute.
+- If your connection can't sustain the stream, video may skip to keep up with
+  the sound. That is a bandwidth limit rather than a bug, and a
+  lower-quality source will help.
+- Resume positions are stored on the computer running the middleware, so they
+  don't follow you to a different setup.
+- Both parts need updating together: reinstall the VPK **and** restart the
+  middleware.

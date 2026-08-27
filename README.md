@@ -13,7 +13,7 @@ genre, pick an episode and a source, and watch: on a handheld from 2011,
 with hardware-decoded video, working audio, subtitles, audio track selection
 and touch controls.
 
-![status](https://img.shields.io/badge/status-beta-orange)
+![status](https://img.shields.io/badge/status-stable-green)
 ![platform](https://img.shields.io/badge/platform-PS%20Vita-blue)
 
 ---

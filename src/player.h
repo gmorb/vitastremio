@@ -44,6 +44,13 @@ void vs_play_trim(int delta_us);
 /* Nonzero while either stream is still alive. */
 int  vs_play_running(void);
 
+/* Nonzero while playback is held waiting for the audio ring to refill.
+ *
+ * The master clock is frozen for the duration, so video holds with the
+ * sound rather than running ahead of it. Draw an indicator while this is
+ * set -- otherwise a network stall looks like the player has desynced. */
+int  vs_play_buffering(void);
+
 /* Total length of the stream in seconds; 0 if the server didn't report it
  * (live sources, or a probe that failed). Callers must handle 0 rather than
  * drawing a progress bar that implies false progress. */
@@ -59,6 +66,27 @@ void vs_play_gc(void);
  * schedule would desync everything downstream of it. */
 void vs_play_set_audio_track(int idx);
 int  vs_play_audio_track(void);
+
+/* Headphone/Bluetooth loudness boost. Film is mastered around -24 LUFS,
+ * which is correct for a cinema and far too quiet for a handheld; on
+ * headphones the Vita's speakers are no longer the limit, so the extra
+ * gain is usable. The server applies it, behind a limiter that is always
+ * in the chain -- the Vita cannot exceed 0 dB on its own output.
+ *
+ * Like track selection, this takes effect on the next vs_play_start. */
+void vs_play_set_boost(int on);
+int  vs_play_boost(void);
+
+/* Content id (tt0111161, or tt0903747:2:5) for the title being played.
+ *
+ * Passed to the server on the audio request so it can record how far this
+ * title has been watched. Keyed on content rather than on the stream key,
+ * because the stream key names one particular source -- resume would
+ * otherwise break the moment a different source was picked for the same
+ * episode, which is routine when a debrid link expires.
+ *
+ * Optional: playback is unaffected if it is never set, only resume is. */
+void vs_play_set_content_id(const char *id);
 
 /* Pause and resume. Freezes the audio clock and the video schedule together,
  * so resuming continues from exactly where it stopped. While paused the

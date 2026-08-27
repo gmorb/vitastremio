@@ -627,6 +627,32 @@ static char *fetch_retry(const char *path, int *out_len)
     return NULL;
 }
 
+/* Where this title was last watched to, or 0 to start from the beginning.
+ *
+ * Deliberately synchronous rather than going through job_submit. It runs at
+ * the moment X is pressed, where vs_play_start is about to block on its own
+ * connection anyway, and the reply is a single short line. Routing it
+ * through the worker would mean either blocking on the job queue or
+ * starting playback and seeking afterwards -- which would be visible as a
+ * jump, and would restart the transcode twice.
+ *
+ * A failure here is not an error: no reply means no resume, and playback
+ * proceeds from the start.
+ */
+static int resume_point(const char *id)
+{
+    char  path[160], *body;
+    int   len = 0, secs = 0;
+
+    if (!id || !id[0]) return 0;
+    snprintf(path, sizeof(path), "/progress?id=%s", id);
+    body = vs_get_all(g_mw_ip, g_mw_port, path, &len);
+    if (!body) return 0;
+    if (len > 0) secs = atoi(body);
+    free(body);
+    return secs > 0 ? secs : 0;
+}
+
 static int worker_main(SceSize args, void *argp)
 {
     (void)args; (void)argp;
@@ -1895,9 +1921,39 @@ static void draw_playing(void)
     if (g_sub_picker) draw_sub_picker();
     if (g_aud_picker) draw_aud_picker();
 
+    /* Buffering indicator.
+     *
+     * Without this a network stall is invisible: the picture holds, the
+     * sound holds, and nothing says why -- which reads as the player having
+     * hung rather than as the connection catching up. The clock is frozen
+     * while this is on screen, so playback resumes in sync by itself.
+     *
+     * Drawn as a ring of dots with one brightened, stepped by a local frame
+     * counter. Cheap, and it does not need a texture. */
+    if (vs_play_buffering()) {
+        static int spin;
+        const float cx = 480.0f, cy = 272.0f, rad = 30.0f;
+        const int   N = 28;                 /* dots around the ring */
+        int i, head = (spin++ / 2) % N;
+
+        for (i = 0; i < N; i++) {
+            /* Distance behind the leading dot, which sets brightness: a
+             * comet tail around a full circle rather than a spinning
+             * segment with hard ends. */
+            int   back = (head - i + N) % N;
+            float t    = 1.0f - (float)back / (float)N;
+            float a    = (float)i * (6.2831853f / (float)N);
+            unsigned char al = (unsigned char)(40.0f + 215.0f * t * t);
+
+            vita2d_draw_fill_circle(cx + rad * cosf(a),
+                                    cy + rad * sinf(a),
+                                    2.6f, RGBA8(0x7B, 0x5C, 0xFF, al));
+        }
+    }
+
     if (g_show_stats) {
         vs_play_stat st;
-        char l1[128], l2[128], l3[160];
+        char l1[128], l2[160], l3[160];
 
         vs_play_stats(&st);
 
@@ -1918,10 +1974,12 @@ static void draw_playing(void)
          * sound. Should settle within a few tens of ms and stay there. */
         snprintf(l2, sizeof(l2),
                  "shown %ld  drop %ld  under %ld  resync %ld  q%d  "
-                 "sync %+dms  trim %+dms (tot %+dms)  %ld.%02ldHz",
+                 "sync %+dms  trim %+dms (tot %+dms)  %ld.%02ldHz  "
+                 "[]boost %s",
                  st.presented, st.dropped, st.underruns, st.resyncs,
                  st.queued, st.av_ms, st.trim_ms, st.total_ms,
-                 st.hz_milli / 1000, (st.hz_milli % 1000) / 10);
+                 st.hz_milli / 1000, (st.hz_milli % 1000) / 10,
+                 vs_play_boost() ? "ON" : "off");
 
         ui_round_rect(12, 10, 936, 74, 10, RGBA8(0x0C, 0x0A, 0x14, 0xE0));
         ui_text(26, 30, st.irregular ? C_ACCENT : C_TEXT, 0.82f, l1);
@@ -2075,10 +2133,16 @@ static void handle_streams(unsigned int pressed)
     }
 
     if ((pressed & SCE_CTRL_CROSS) && g_stream_count > 0) {
-        g_seek_base = 0;
+        int resume = resume_point(g_cur_id);
+
+        vs_play_set_content_id(g_cur_id);
+        g_seek_base = resume;
         if (vs_play_start(g_mw_ip, g_mw_port,
-                          g_streams[g_stream_sel].key, 0) == 0) {
+                          g_streams[g_stream_sel].key, resume) == 0) {
             g_screen = SCR_PLAYING;
+            if (resume > 0)
+                snprintf(g_status, sizeof(g_status), "resumed at %d:%02d:%02d",
+                         resume / 3600, (resume / 60) % 60, resume % 60);
         } else {
             snprintf(g_status, sizeof(g_status), "playback failed to start");
         }
@@ -2346,6 +2410,19 @@ static void handle_playing(unsigned int pressed)
         }
 
         if (step) vs_play_trim(step);
+
+        /* SQUARE toggles the headphone/Bluetooth loudness boost.
+         *
+         * It lives here rather than on the transport bar because it is a
+         * set-once preference, and because applying it needs the audio
+         * stream restarted -- the server builds the filter chain when the
+         * request arrives. seek_by(0) is the same restart the audio track
+         * picker already uses, so playback resumes where it left off. */
+        if (pressed & SCE_CTRL_SQUARE) {
+            vs_play_set_boost(!vs_play_boost());
+            seek_by(0);
+            return;
+        }
     }
 
     if (pressed & SCE_CTRL_CIRCLE) { stop_playback(); return; }
@@ -2479,7 +2556,20 @@ int main(void)
             sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
 
         /* Must run every refresh while playing, before drawing. */
-        if (g_screen == SCR_PLAYING) vs_play_present();
+        if (g_screen == SCR_PLAYING) {
+            /* DIAGNOSTIC, paired with the hold log in vs_play_present.
+             *
+             * If the picture freezes and NEITHER line appears, the main loop
+             * itself is not turning over -- the fault is above this call,
+             * not inside the player. If this line appears while the hold log
+             * does not, the loop is running but present is returning early
+             * somewhere other than the hold branch. */
+            static int alive;
+            if ((alive++ % 600) == 0)
+                vs_log("main loop alive: spin=%ld screen=%d ime=%d",
+                       (long)g_spin, g_screen, vs_ime_is_active());
+            vs_play_present();
+        }
         job_collect();
         if (g_screen == SCR_CATALOG && g_job_state == JOB_IDLE) {
             /* Evicting on a slow cadence keeps it off the hot path; the
