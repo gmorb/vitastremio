@@ -212,6 +212,7 @@ typedef struct {
     long            last_correct_vsync;
     long            last_present_vsync;
     long            last_watchdog_vsync;
+    long            last_snap_vsync;
 
     /* Vblank counter health.
      *
@@ -849,6 +850,16 @@ static int decode_au(unsigned char *au, int len, long pts_us, int slot)
  * so by the time this triggers the viewer can already see the problem, and a
  * single jump is the least bad way out of it. */
 #define AV_SNAP_US 150000
+
+/* Refreshes a snap is given to play out before another may fire.
+ *
+ * A snap moves the schedule and lets the refresh count catch up, which takes
+ * as long as the error was large -- three seconds of error needs three
+ * seconds to absorb. Measuring again before then sees the same error still
+ * present and fires again, and again, each one re-presenting a frame. The
+ * result is roughly 1fps video while the sound plays normally. Five seconds
+ * covers any snap the AV_SNAP_US threshold can produce in practice. */
+#define AV_SNAP_COOLDOWN 300
 
 /* Corrections are decided on a smoothed offset, not a raw sample.
  *
@@ -1692,11 +1703,20 @@ void vs_play_present(void)
                 if (lead < -WATCHDOG_MAX_LEAD) lead = -WATCHDOG_MAX_LEAD;
 
                 if (err > 1000000 || err < -1000000)
-                    vs_log("VIDEO CANNOT KEEP UP: %ld ms behind audio at "
-                           "frame %ld. The schedule cannot fix a deficit "
-                           "this large -- the source, network or encoder is "
-                           "not delivering frames fast enough.",
-                           err / 1000, P.frames[newest].index);
+                    /* err = clock - pts. POSITIVE means the frame is older
+                     * than the clock, i.e. video is behind. Negative means
+                     * the frame is from the future and the AUDIO is behind
+                     * -- the opposite problem, and reporting both as
+                     * "behind audio" made a stalling audio stream look like
+                     * a slow video pipeline. */
+                    vs_log("LARGE A/V GAP: picture %ld ms %s sound at frame "
+                           "%ld. Too large for the schedule to absorb -- "
+                           "%s is not keeping up.",
+                           (err > 0 ? err : -err) / 1000,
+                           err > 0 ? "behind" : "ahead of",
+                           P.frames[newest].index,
+                           err > 0 ? "video (source, network or encoder)"
+                                   : "audio (network)");
                 else
                     vs_log("schedule stuck at v_rel=%ld after %d refreshes; "
                            "re-anchoring to frame %ld (%ld ms from audio)",
@@ -1797,6 +1817,15 @@ void vs_play_present(void)
         drift = P.av_offset_us - P.av_trim_us;
     }
 
+    /* Nothing to correct while buffering.
+     *
+     * The clock is deliberately held still across a stall, so the offset
+     * against it grows for as long as the stall lasts -- not because
+     * anything is wrong, but because measured time has stopped while frames
+     * keep arriving. Correcting on that reading chases an error that is
+     * about to vanish on its own the moment the clock restarts. */
+    if (P.buffering) return;
+
     /* One refresh per correction, at most once per second, while the error
      * is small: slow enough that the cadence stays regular, fast enough to
      * close a visible gap in a few seconds. Past AV_SNAP_US it corrects the
@@ -1805,26 +1834,36 @@ void vs_play_present(void)
         P.vsync_n - P.last_correct_vsync > 60) {
         long period_us = (long)(1000000000000LL / P.hz_micro);
         long steps     = 1;
+        int  big       = (drift > AV_SNAP_US || drift < -AV_SNAP_US);
 
         /* Correct in PROPORTION to the error, not one refresh at a time.
          *
-         * A single refresh per second is 16.7ms/s of authority. That closes
-         * the tens of milliseconds this loop was built for, but nothing
-         * larger: after two seconds of buffering the offset is hundreds of
-         * milliseconds, needing half a minute of perfect conditions -- and
-         * if the rate estimate is even slightly off, the error grows faster
-         * than the correction shrinks it and the gap simply widens. That is
-         * the "milliseconds keep climbing" case.
+         * A single refresh per second is 16.7ms/s of authority -- enough for
+         * the tens of milliseconds this loop was built for, and nothing
+         * larger. After two seconds of buffering the offset is hundreds of
+         * milliseconds, which at that rate takes half a minute, and if the
+         * rate estimate is even slightly off it grows faster than the
+         * correction removes it.
          *
-         * Past AV_SNAP_US the nudge is abandoned and the whole error comes
-         * out in one move. It costs one visible jump, which beats sound and
-         * picture sliding apart indefinitely. */
-        if (drift > AV_SNAP_US || drift < -AV_SNAP_US) {
+         * A snap takes the whole error out in one move instead. But ONE
+         * move: a snap needs seconds to actually play out, because it works
+         * by moving the schedule and letting the refresh count catch up.
+         * Re-measuring a second later shows the error still there, snapping
+         * again, and again -- which does not correct anything, it just
+         * re-presents once a second. That is 1fps video with the sound
+         * running normally, and it is exactly what happened before this
+         * cooldown existed. */
+        if (big && P.vsync_n - P.last_snap_vsync < AV_SNAP_COOLDOWN)
+            return;
+
+        if (big) {
             long mag = (drift > 0) ? drift : -drift;
             steps = (mag + period_us / 2) / period_us;
             if (steps < 1) steps = 1;
-            vs_log("sync snap: %ld ms out, correcting %ld refreshes at once",
-                   drift / 1000, steps);
+            vs_log("sync snap: picture %ld ms %s sound, correcting %ld "
+                   "refreshes at once", mag / 1000,
+                   drift > 0 ? "ahead of" : "behind", steps);
+            P.last_snap_vsync = P.vsync_n;
             /* A jump this size must not be averaged across by the filter,
              * and the baseline shift below cannot represent it honestly
              * either -- so re-seed both rather than distort them. */

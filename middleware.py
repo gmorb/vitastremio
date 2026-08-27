@@ -195,6 +195,10 @@ def save_progress_now():
 
 
 def record_progress(cid, seconds, duration=0):
+    # NOTE: duration is not currently supplied by the audio path, so entries
+    # carry d=0 and the "nearly finished, start clean" rule never applies.
+    # Harmless -- a finished title simply resumes near its end -- but it is
+    # why that rule looks dormant.
     """Note where a title has been watched to.
 
     Called from the audio stream as it serves, so it costs nothing extra and

@@ -644,12 +644,23 @@ static int resume_point(const char *id)
     char  path[160], *body;
     int   len = 0, secs = 0;
 
-    if (!id || !id[0]) return 0;
+    if (!id || !id[0]) {
+        vs_log("resume: no content id, starting from the beginning");
+        return 0;
+    }
     snprintf(path, sizeof(path), "/progress?id=%s", id);
     body = vs_get_all(g_mw_ip, g_mw_port, path, &len);
-    if (!body) return 0;
+    if (!body) {
+        /* Not fatal -- playback just starts at zero. Logged because a
+         * silent zero here is indistinguishable from "nothing watched yet",
+         * and the difference matters when a stream dies mid-film and the
+         * next play unexpectedly begins at the start. */
+        vs_log("resume: no reply from server for id=%s", id);
+        return 0;
+    }
     if (len > 0) secs = atoi(body);
     free(body);
+    vs_log("resume: id=%s -> %ds", id, secs);
     return secs > 0 ? secs : 0;
 }
 
