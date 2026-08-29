@@ -1292,10 +1292,20 @@ _poster_cache = {}
 _poster_lock = threading.Lock()
 
 
-def resize_poster(url):
-    """Shell out to ffmpeg rather than depend on Pillow."""
+def resize_poster(url, w=None, h=None):
+    """Shell out to ffmpeg rather than depend on Pillow.
+
+    Size is a parameter so the same fetch-scale-cache path serves both the
+    128x186 catalogue posters and the 960x544 backdrops behind the source
+    list and loading screen. Scaling here rather than on the Vita is the
+    whole point: the originals are often 1920x1080, which the Vita would
+    have to fetch over wifi and decode itself.
+    """
+    w = w or POSTER_W
+    h = h or POSTER_H
+    key = "%s|%dx%d" % (url, w, h)
     with _poster_lock:
-        hit = _poster_cache.get(url)
+        hit = _poster_cache.get(key)
     if hit is not None:
         return hit
 
@@ -1306,7 +1316,7 @@ def resize_poster(url):
         "-reconnect", "1", "-reconnect_streamed", "1",
         "-rw_timeout", "15000000",
         "-i", url,
-        "-vf", "scale=%d:%d" % (POSTER_W, POSTER_H),
+        "-vf", "scale=%d:%d" % (w, h),
         "-frames:v", "1", "-q:v", "6",
         "-f", "mjpeg", "-",
     ]
@@ -1338,7 +1348,7 @@ def resize_poster(url):
             try:
                 out = subprocess.run(
                     ["ffmpeg", "-loglevel", "error", "-nostdin", "-i", tmp,
-                     "-vf", "scale=%d:%d" % (POSTER_W, POSTER_H),
+                     "-vf", "scale=%d:%d" % (w, h),
                      "-frames:v", "1", "-q:v", "6", "-f", "mjpeg", "-"],
                     capture_output=True, timeout=POSTER_TIMEOUT).stdout
             finally:
@@ -1358,7 +1368,7 @@ def resize_poster(url):
             # the oldest key is enough of an eviction policy here.
             if len(_poster_cache) >= POSTER_CACHE_MAX:
                 _poster_cache.pop(next(iter(_poster_cache)))
-            _poster_cache[url] = out
+            _poster_cache[key] = out
     else:
         print("[mw] poster produced %d bytes: %s" % (len(out), url[:70]))
     return out
@@ -1506,6 +1516,17 @@ class Handler(BaseHTTPRequestHandler):
                                         one("id")))
             elif parsed.path == "/poster":
                 self._send(resize_poster(one("u")), "image/jpeg")
+            elif parsed.path == "/art":
+                # Same pipeline as /poster at a caller-chosen size, for the
+                # backdrop behind the source list and loading screen.
+                # Clamped: the Vita panel is 960x544 and anything larger is
+                # just wifi and decode time it does not need to spend.
+                try:
+                    aw = max(16, min(960, int(one("w", "960") or 960)))
+                    ah = max(16, min(544, int(one("h", "544") or 544)))
+                except ValueError:
+                    aw, ah = 960, 544
+                self._send(resize_poster(one("u"), aw, ah), "image/jpeg")
             elif parsed.path == "/v":
                 src = key_decode(one("s"))
                 num, den, milli, dur = probe_stream(src)
@@ -1670,8 +1691,12 @@ class Handler(BaseHTTPRequestHandler):
         return pack(dedup)
 
     def meta(self, ctype, mid):
-        """First row: name, year, runtime, description.
-        Subsequent rows (series only): videoId, season, episode, title"""
+        """First row: name, year, runtime, description, background, logo.
+        Subsequent rows (series only): videoId, season, episode, title
+
+        The two artwork URLs are appended after description rather than
+        inserted, so an older client that only reads four fields is
+        unaffected."""
         rows = []
         for man in ADDONS:
             base = addon_base(man)
@@ -1684,8 +1709,13 @@ class Handler(BaseHTTPRequestHandler):
             if not m:
                 continue
             desc = (m.get("description") or "")[:600]
+            # background is the wide artwork, logo the transparent title
+            # treatment. Both are optional -- plenty of addons supply
+            # neither, so the client has to cope with empty strings.
             rows.append([m.get("name", ""), str(m.get("year", "")),
-                         str(m.get("runtime", "")), desc])
+                         str(m.get("runtime", "")), desc,
+                         m.get("background", "") or "",
+                         m.get("logo", "") or ""])
             for v in (m.get("videos") or []):
                 rows.append([v.get("id", ""), str(v.get("season", "")),
                              str(v.get("episode", "")), v.get("title", "")])

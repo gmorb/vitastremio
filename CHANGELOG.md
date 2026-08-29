@@ -2,26 +2,26 @@
 
 All notable changes to vitastremio (PS Vita Stremio client + middleware).
 
-## [1.2] - 2026-08-27
+## [1.3] - 2026-08-27
+
+**Update both halves.** Reinstall the VPK *and* restart the middleware.
 
 ### Fixed
 
-**Video dropping to a slideshow.** After a stall, playback could fall to
-roughly one frame per second and stay there while the audio ran on normally.
-Correcting a large sync gap takes a few seconds to play out, and the player
-was re-correcting before the previous attempt had finished -- so it re-drew
-once a second instead of catching up. It now lets a correction complete
-before making another.
+**Sound and picture drifting apart after about 35 minutes.** Long films would
+play perfectly and then, always at roughly the same point, the picture would
+jump ahead of the sound and never settle again. The app was losing track of
+time once playback passed 35 minutes and 47 seconds, which is why it happened
+at the same moment every time. It now keeps time correctly for far longer
+than any film.
 
-**Sound and picture drifting apart while buffering.** The player was trying
-to correct sync during a stall, when playback is deliberately held still and
-the measurement means nothing. It now waits until playback resumes, which is
-when the gap is real and worth closing.
+### Added
 
-### Changed
+**A proper loading screen.** Starting something used to show a black screen
+while it buffered, which was hard to tell apart from the app having frozen.
+You now get the film's artwork, its title, and a spinner while it gets ready.
 
-- Playback log messages now report which of sound or picture is ahead. They
-  previously described both cases the same way, which made a stalling audio
-  stream look like a slow video connection.
-- When a stream starts from the beginning unexpectedly, the log now records
-  whether a saved resume position was found, so the cause can be identified.
+### Worth knowing
+
+- Artwork comes from your addons, so titles without it will show the title on
+  a plain background instead. Nothing else changes.

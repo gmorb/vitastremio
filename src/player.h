@@ -44,6 +44,11 @@ void vs_play_trim(int delta_us);
 /* Nonzero while either stream is still alive. */
 int  vs_play_running(void);
 
+/* Frames presented so far this session. Zero means nothing has reached the
+ * screen yet, which is how the UI knows to show a loading screen rather
+ * than a black one. */
+long vs_play_presented(void);
+
 /* Nonzero while playback is held waiting for the audio ring to refill.
  *
  * The master clock is frozen for the duration, so video holds with the

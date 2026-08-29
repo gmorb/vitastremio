@@ -25,6 +25,7 @@
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/videodec.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,12 +92,22 @@
 #define NET_MAX_STALLS 3
 
 #define RING_V       (1536 * 1024)
-#define RING_A       (256 * 1024)
+/* Audio gets a DEEPER buffer than video, in time, despite being a quarter
+ * of the bitrate.
+ *
+ * It is the master clock. When it starves, the clock is held still and
+ * everything downstream stops with it -- so its buffer is not sized for
+ * fairness against video, it is sized for how long a network hiccup it must
+ * ride out invisibly. It previously held 2.0s against video's 4.2s, which
+ * had it exactly backwards: logs showed 145 underruns in a single session.
+ * 8s of audio costs 1MB, which is cheap for the thing that must never run
+ * dry. */
+#define RING_A       (1024 * 1024)
 
 /* How much to bank before starting. Audio is the master clock, so its
  * cushion is what actually prevents the clock from stalling. */
 #define PREBUF_V     (384 * 1024)
-#define PREBUF_A     (64 * 1024)
+#define PREBUF_A     (192 * 1024)   /* 1.5s -- see RING_A */
 #define PREBUF_MAX_WAIT_US (12 * 1000000)
 
 #define NUM_FRAMES 4
@@ -117,7 +128,7 @@
 /* state: 0 free (decoder may claim), 1 ready (main may show/release) */
 typedef struct {
     vita2d_texture *tex;
-    long            pts_us;
+    int64_t         pts_us;     /* 64-bit: overflows 32 bits at 35.8 min */
     long            index;     /* frame number, drives the vsync schedule */
     int             state;
 } frame_slot;
@@ -130,9 +141,9 @@ typedef struct {
     SceUID          lock;
     volatile int    running;
     volatile int    quit_requested;
-    volatile long   samples_played;       /* audio master clock             */
+    volatile int64_t samples_played;      /* audio master clock             */
     SceUInt64          clock_epoch;       /* timer origin for this playback  */
-    volatile long      clock_offset_us;   /* sample-counter minus timer       */
+    volatile int64_t   clock_offset_us;   /* sample-counter minus timer       */
     volatile int       clock_locked;
     int                clock_samples;
 
@@ -143,7 +154,7 @@ typedef struct {
      * other's anchor. */
     volatile int       paused;
     SceUInt64          pause_started;
-    volatile long      pause_accum_us;
+    volatile int64_t   pause_accum_us;    /* microseconds: must be 64-bit */
 
     /* Set while the audio ring is dry and the clock is held still. Read by
      * the UI to draw a buffering indicator; see stall_begin/stall_end. */
@@ -200,19 +211,28 @@ typedef struct {
     long            hz_micro;   /* rate x1e6; milli-Hz truncated small steps */
     int             vcount_base;
     long            rate_n0;
-    long            rate_av0;
+    int64_t         rate_av0;   /* snapshot of av_offset_us; same width */
     long            rate_window;
     long            shown_index; /* frame number currently on screen */
     int             hold;        /* refreshes the current frame has held */
     long            hold_hist[6];/* how often a frame held 1..5+ refreshes */
     long            resyncs;
-    volatile long   av_offset_us;/* smoothed; + = video ahead of audio */
-    volatile long   av_trim_us;  /* user target offset, tuned by ear */
+    volatile int64_t av_offset_us;/* smoothed; + = video ahead of audio */
+    volatile int64_t av_trim_us; /* user target offset, tuned by ear */
     int             av_valid;
     long            last_correct_vsync;
     long            last_present_vsync;
     long            last_watchdog_vsync;
-    long            last_snap_vsync;
+    long            last_trace_vsync;   /* rate-limit for the drift trace */
+    int             direct_mode;   /* presenting straight off the clock */
+    int             direct_ok;     /* consecutive refreshes back in sync */
+    int             early_logged;  /* log the early-advance case once */
+    int64_t         last_present_clock; /* clock value at the last present */
+    int64_t         wait_start_clock;   /* state at the start of a wait */
+    int64_t         wait_start_pts;
+    SceUInt64       aud_meas_us;        /* clock-honesty measurement */
+    int64_t         aud_meas_samples;
+    int64_t         aud_meas_pause;
 
     /* Vblank counter health.
      *
@@ -258,7 +278,7 @@ static vs_player P;
  * every seek would defeat the point. */
 #define AV_TRIM_DEFAULT_US 0
 
-static long g_saved_trim_us = AV_TRIM_DEFAULT_US;
+static int64_t g_saved_trim_us = AV_TRIM_DEFAULT_US;
 
 /* Chosen audio stream, -1 for the file's default. Outside P for the same
  * reason as the trim: vs_play_start memsets P, and switching tracks works by
@@ -349,6 +369,9 @@ void vs_play_gc(void) { }
 
 void vs_play_set_audio_track(int idx) { g_audio_track = idx; }
 void vs_play_set_boost(int on)        { g_boost = on ? 1 : 0; }
+long vs_play_presented(void)
+{ return __atomic_load_n(&P.presented, __ATOMIC_ACQUIRE); }
+
 int  vs_play_buffering(void)
 { return __atomic_load_n(&P.buffering, __ATOMIC_ACQUIRE); }
 int  vs_play_boost(void)              { return g_boost; }
@@ -391,20 +414,36 @@ int  vs_play_audio_track(void)        { return g_audio_track; }
  * free-running system timer, so paused wall time is subtracted here; the
  * video schedule runs off the vblank counter and is held by advancing its
  * anchor instead. */
-static long clock_now_rel(void)
+static int64_t clock_now_rel(void)
 {
     SceUInt64 now = sceKernelGetProcessTimeWide();
-    long      rel;
+    int64_t   rel;
 
     if (P.clock_epoch == 0) return 0;
-    rel = (long)(now - P.clock_epoch) - P.pause_accum_us;
+
+    /* 64-BIT, AND IT MATTERS.
+     *
+     * This is elapsed microseconds since playback began. A 32-bit signed
+     * value holds 2147483647 of them -- 2147 seconds, or 35 minutes 47
+     * seconds -- and then wraps to a large negative number.
+     *
+     * Every timestamp comparison in the player is against this. Past that
+     * point the clock read roughly -2147 seconds, so no frame was ever "due"
+     * again: the picture pulled ahead of the sound and stayed there, and
+     * direct mode would wait five seconds for a frame that only got further
+     * away. It was reported as sync drift, and it was reproducible at
+     * exactly the same moment in every film -- frame 51530 or so at 23.976
+     * fps, which is 35.8 minutes.
+     *
+     * Anything holding microseconds in this player has to be 64-bit. */
+    rel = (int64_t)(now - P.clock_epoch) - (int64_t)P.pause_accum_us;
 
     if (P.paused && P.pause_started)
-        rel -= (long)(now - P.pause_started);
+        rel -= (int64_t)(now - P.pause_started);
     return rel;
 }
 
-static long audio_clock_us(void)
+static int64_t audio_clock_us(void)
 {
     /* samples_played counts samples HANDED TO the audio port, but the
      * hardware is still working through the previously queued grain when
@@ -412,7 +451,7 @@ static long audio_clock_us(void)
      * clock ahead of what is audible, and video scheduled against it would
      * lead the sound -- heard as audio lagging. Back off one grain so the
      * clock tracks what the listener is actually hearing. */
-    long now_rel;
+    int64_t now_rel;
 
     if (P.clock_epoch == 0) return 0;
     now_rel = clock_now_rel();
@@ -420,10 +459,20 @@ static long audio_clock_us(void)
     if (!P.clock_locked) {
         /* Before the filter has settled, fall back to the raw counter so
          * startup alignment still has something to work with. */
-        return (long)((double)P.samples_played * 1000000.0 / AUD_RATE)
+        return (int64_t)((double)P.samples_played * 1000000.0 / AUD_RATE)
                - AUD_GRAIN_US + AUD_PIPELINE_OFFSET_US;
     }
     return now_rel + P.clock_offset_us + AUD_PIPELINE_OFFSET_US;
+}
+
+/* How many decoded frames are waiting. Diagnostic only. */
+static int ready_count(void)
+{
+    int i, n = 0;
+    for (i = 0; i < NUM_FRAMES; i++)
+        if (__atomic_load_n(&P.frames[i].state, __ATOMIC_ACQUIRE) == SLOT_READY)
+            n++;
+    return n;
 }
 
 /* Freeze and unfreeze the master clock around an audio underrun.
@@ -458,7 +507,7 @@ static void stall_begin(void)
 static void stall_end(void)
 {
     if (!P.buffering) return;
-    P.pause_accum_us += (long)(sceKernelGetProcessTimeWide()
+    P.pause_accum_us += (int64_t)(sceKernelGetProcessTimeWide()
                                - P.stall_started);
     P.stall_started = 0;
     __atomic_store_n(&P.buffering, 0, __ATOMIC_RELEASE);
@@ -476,14 +525,26 @@ static void stall_end(void)
 static void audio_clock_update(void)
 {
     SceUInt64 now = sceKernelGetProcessTimeWide();
-    long      now_rel, from_samples, inst;
+    /* 64-BIT. These are microseconds since playback began.
+     *
+     * from_samples passes 2147483647 -- INT32_MAX -- at 2147.48 seconds,
+     * which is 35 minutes 47 seconds, or frame 51488 at 23.976fps. As a
+     * 32-bit long it wrapped there, inst went with it, and the offset filter
+     * was handed a nonsense target.
+     *
+     * The visible result was a single step in the A/V error at that exact
+     * point in every film: drift held a steady 9ms for half an hour, then
+     * jumped to 150ms inside one second, at shown frame ~51500. Everything
+     * afterwards -- direct mode engaging, waits that never resolved,
+     * corrections that could not close the gap -- followed from this. */
+    int64_t   now_rel, from_samples, inst;
 
     if (P.clock_epoch == 0) {
         P.clock_epoch = now;
         return;
     }
     now_rel      = clock_now_rel();
-    from_samples = (long)((double)P.samples_played * 1000000.0 / AUD_RATE)
+    from_samples = (int64_t)((double)P.samples_played * 1000000.0 / AUD_RATE)
                    - AUD_GRAIN_US;
     inst         = from_samples - now_rel;
 
@@ -621,6 +682,29 @@ static int audio_thread(SceSize args, void *argp)
                          (int[]){ SCE_AUDIO_VOLUME_0DB,
                                   SCE_AUDIO_VOLUME_0DB });
 
+    /* Confirm the port runs at the rate the clock assumes.
+     *
+     * audio_clock_us() converts samples_played to microseconds by dividing
+     * by AUD_RATE, so that constant IS the master clock's tick length. If
+     * the hardware accepted a different rate, every timestamp in the player
+     * is scaled by the ratio, and the picture drifts against the sound at
+     * exactly that ratio -- with no underruns, because nothing is actually
+     * going wrong with delivery.
+     *
+     * That matches an observed failure: the clock advancing at about 94% of
+     * real time, the picture pulling ahead ~50ms per second, and direct mode
+     * waiting five seconds for a frame that only got further away. */
+    {
+        int got = sceAudioOutGetConfig(port, SCE_AUDIO_OUT_CONFIG_TYPE_FREQ);
+        if (got > 0 && got != AUD_RATE)
+            vs_log("!! audio port opened at %d Hz, not the %d Hz the clock "
+                   "assumes -- timing will drift by %.1f%%",
+                   got, AUD_RATE,
+                   100.0 * (double)(got - AUD_RATE) / (double)AUD_RATE);
+        else
+            vs_log("audio port at %d Hz", got > 0 ? got : AUD_RATE);
+    }
+
     while (P.running && !P.quit_requested) {
         if (P.paused) {
             /* Stop consuming. The rings back up, the reader threads block on
@@ -672,6 +756,48 @@ static int audio_thread(SceSize args, void *argp)
         if (sceAudioOutOutput(port, buf) < 0) break;
         P.samples_played += AUD_GRAIN;
         audio_clock_update();
+
+        /* Measure the master clock against real time.
+         *
+         * This is the one measurement that says whether the clock itself is
+         * honest. samples_played / AUD_RATE is what every timestamp in the
+         * player is compared against; if it does not advance at the same
+         * rate as the system timer, the picture drifts from the sound at
+         * exactly that ratio no matter how the presenter behaves -- and
+         * with no underruns to hint at it, because delivery is fine.
+         *
+         * Reported as a percentage so it is unmistakable: 100% is correct,
+         * and the value seen while the picture pulled ahead was around 94%. */
+        if ((P.samples_played % (AUD_RATE * 30)) < AUD_GRAIN) {
+            SceUInt64 wall = sceKernelGetProcessTimeWide();
+            if (P.aud_meas_us) {
+                double played = (double)(P.samples_played - P.aud_meas_samples)
+                                * 1000000.0 / AUD_RATE;
+                double frozen = (double)(P.pause_accum_us - P.aud_meas_pause);
+                double wallus = (double)(wall - P.aud_meas_us);
+
+                /* Report against TRUE wall time, and say separately how much
+                 * of the window the clock spent frozen.
+                 *
+                 * The previous version subtracted frozen time before taking
+                 * the ratio, which made the measurement blind to the one
+                 * thing it needed to catch: it read 99.99% whether the clock
+                 * ran continuously or stopped for half the window, because
+                 * stopped time had already been removed from the
+                 * denominator. A clock that is accurate whenever it runs but
+                 * frequently stops is exactly what makes the picture pull
+                 * ahead and stay there -- video keeps being decoded while
+                 * the reference it is waited against is not moving. */
+                if (wallus > 1000.0)
+                    vs_log("audio clock: %.2f%% of wall time over %.0fs "
+                           "(%.0f ms of it frozen)",
+                           100.0 * played / wallus, wallus / 1000000.0,
+                           frozen / 1000.0);
+            }
+            P.aud_meas_us      = wall;
+            P.aud_meas_samples = P.samples_played;
+            P.aud_meas_pause   = P.pause_accum_us;
+        }
     }
 
 done:
@@ -785,7 +911,7 @@ static int decoder_open(void)
 }
 
 /* Feed one access unit; on success copy the picture into the back texture. */
-static int decode_au(unsigned char *au, int len, long pts_us, int slot)
+static int decode_au(unsigned char *au, int len, int64_t pts_us, int slot)
 {
     SceAvcdecAu           in;
     SceAvcdecArrayPicture arr;
@@ -797,6 +923,10 @@ static int decode_au(unsigned char *au, int len, long pts_us, int slot)
     memset(&pic, 0, sizeof(pic));
     memset(&arr, 0, sizeof(arr));
 
+    /* The decoder's pts is write-only from our side: the slot's own pts_us
+     * is what scheduling uses, and this value is never read back. Truncating
+     * to 32 bits here is therefore harmless, unlike everywhere else in the
+     * player where a 32-bit microsecond value wraps at 35m47s. */
     in.pts.lower  = (SceUInt32)pts_us;
     in.dts.lower  = (SceUInt32)pts_us;
     in.es.pBuf    = au;
@@ -859,7 +989,27 @@ static int decode_au(unsigned char *au, int len, long pts_us, int slot)
  * present and fires again, and again, each one re-presenting a frame. The
  * result is roughly 1fps video while the sound plays normally. Five seconds
  * covers any snap the AV_SNAP_US threshold can produce in practice. */
-#define AV_SNAP_COOLDOWN 300
+/* Error at which direct mode hands back to the vsync schedule. Comfortably
+ * inside what anyone can perceive, and well above the jitter of a single
+ * refresh, so the handover neither happens too eagerly nor never. */
+#define DIRECT_EXIT_US 40000
+
+/* Refreshes direct mode will wait, with the clock alive, before showing a
+ * frame regardless.
+ *
+ * This is a backstop against a clock that has stalled in a way the movement
+ * check does not catch -- NOT a general timeout. It has to sit above any
+ * legitimate wait, because waiting is how a picture-ahead gap closes: the
+ * sound advances until it reaches the frame. At half a second it cut those
+ * waits short and pushed the picture further ahead instead of letting the
+ * gap close, and the error persisted for as long as playback lasted.
+ *
+ * Five seconds is beyond anything AV_SNAP_US can hand over here, so in
+ * practice it never fires -- which is the point. When the clock genuinely
+ * stops, the movement check catches it within one frame and paces from the
+ * stream's frame rate instead; this only covers the case where that check
+ * is somehow wrong. */
+#define DIRECT_MAX_WAIT 300
 
 /* Corrections are decided on a smoothed offset, not a raw sample.
  *
@@ -1001,7 +1151,7 @@ static int video_thread(SceSize args, void *argp)
         {
             /* Exact rational timing from the source rate the middleware
              * reported. Rounding 23.976 to 24 would drift ~3.6s per hour. */
-            long pts_us = (long)(frame_index * 1000000000LL / P.fps_milli);
+            int64_t pts_us = frame_index * 1000000000LL / P.fps_milli;
             int  slot = -1, r;
 
             /* Claim a FREE slot, waiting if the queue is full.
@@ -1311,7 +1461,8 @@ static void rate_reset(void)
 
 static void track_rate(void)
 {
-    long elapsed, delta_av, ppm, step;
+    long    elapsed, ppm, step;
+    int64_t delta_av;       /* difference of two 64-bit clock offsets */
 
     if (!P.av_valid) return;                 /* offset filter not seeded yet */
 
@@ -1353,7 +1504,7 @@ static void track_rate(void)
             return;
         }
 
-        ppm = (delta_av * 1000000L) / window_us;
+        ppm = (long)((delta_av * 1000000LL) / window_us);
     }
 
     if (ppm >  RATE_MAX_STEP_PPM) ppm =  RATE_MAX_STEP_PPM;
@@ -1377,7 +1528,7 @@ static void track_rate(void)
             vs_log("rate %ld.%04ld -> %ld.%04ld Hz (drift %ld ms/window)",
                    old_hz / 1000000, (old_hz % 1000000) / 100,
                    P.hz_micro / 1000000, (P.hz_micro % 1000000) / 100,
-                   delta_av / 1000);
+                   (long)(delta_av / 1000));
     }
 
     P.rate_n0  = P.vsync_n;
@@ -1390,7 +1541,8 @@ static void track_rate(void)
 /* Called once per vblank from the main loop, before drawing. */
 void vs_play_present(void)
 {
-    long v_rel, target, drift;
+    long    v_rel, target;
+    int64_t drift;          /* microseconds; 64-bit like the clock */
     int  slot;
 
     /* Refresh counter, advanced by DELTAS rather than read as a position.
@@ -1483,14 +1635,227 @@ void vs_play_present(void)
         if (P.paused) {
             /* Advance the anchor in step, so v_rel -- and therefore the
              * frame the schedule wants -- does not move. Without this,
-             * resuming would find the schedule minutes ahead and race. */
+             * resuming would find the schedule minutes ahead and race.
+             *
+             * P.hold is deliberately NOT incremented here. It measures how
+             * long the presenter has been waiting for a frame to fall due,
+             * and a pause is not waiting -- the clock is frozen too, so
+             * nothing can fall due by definition. Counting paused refreshes
+             * meant a five second pause arrived at 300, and direct mode
+             * read that on resume as a five second wait that had already
+             * failed: it immediately advanced the picture early, pushing it
+             * ahead of the sound. Pausing to check the seek bar was enough
+             * to knock playback out of sync.
+             *
+             * P.repeats is likewise a cadence statistic, and a paused frame
+             * is not a repeated one. */
             P.anchor += P.vsync_n - prev;
-            P.hold++;
-            P.repeats++;
             return;                      /* hold the current frame */
         }
     }
     track_rate();
+
+    /* DIRECT MODE.
+     *
+     * Everything below this point picks frames by counting refreshes from
+     * an anchor. That produces exact 3:2 cadence for 23.976 on 60Hz, which
+     * is worth having -- but it is an open loop. It computes when a frame
+     * SHOULD be shown and trusts the arithmetic, and every recovery bolted
+     * onto it has to nudge the anchor and then wait seconds to find out
+     * whether the nudge worked.
+     *
+     * That fails outright once the picture is seconds from the sound. The
+     * target only ever counts upward from shown_index, so moving the anchor
+     * backwards cannot rewind anything; it can only make the schedule wait.
+     * Meanwhile the error gets re-measured before the wait resolves, so the
+     * same correction fires again and again against an error that never
+     * moves. Logs showed exactly that: 6.5 seconds out, corrected by ~390
+     * refreshes every 6.5 seconds, indefinitely.
+     *
+     * So when the gap is large, stop scheduling and start looking. Present
+     * the newest decoded frame whose timestamp has actually passed on the
+     * audio clock. That is a closed loop -- it consults the clock every
+     * refresh rather than predicting from it -- so it cannot sit in a wrong
+     * state, and it converges by construction: video holds while the sound
+     * catches up, or skips forward while the picture does, whichever way
+     * round the gap runs.
+     *
+     * Cadence is worse here, which is why it is not the normal path. It
+     * hands back to the schedule as soon as the error is small again. */
+    if (P.direct_mode) {
+        int64_t now  = audio_clock_us();
+        int  best = -1;
+
+        for (int i = 0; i < NUM_FRAMES; i++) {
+            if (__atomic_load_n(&P.frames[i].state,
+                                __ATOMIC_ACQUIRE) != SLOT_READY)
+                continue;
+            if (P.frames[i].pts_us > now)
+                continue;              /* not due yet -- hold, do not guess */
+            if (best < 0 || P.frames[i].index > P.frames[best].index)
+                best = i;
+        }
+
+        if (best < 0) {
+            /* Either nothing decoded, or everything decoded is still in the
+             * future because the sound is behind. Both mean wait.
+             *
+             * But wait with a FLOOR. This path returns before the watchdog
+             * and the backstop, so nothing below can rescue it -- and the
+             * clock it waits on is deliberately frozen whenever audio
+             * stalls. A clock that has stopped never reaches the next
+             * timestamp, so "wait until due" became "wait forever": the
+             * picture froze while the sound played on, which is precisely
+             * the failure this mode was meant to end.
+             *
+             * So after DIRECT_MAX_WAIT of nothing being due, show the next
+             * frame regardless. Presenting a frame early is a small sync
+             * error that the clock closes as it advances. Not presenting
+             * one at all is a frozen picture, which nothing closes. */
+            if (!P.wait_start_clock) {
+                /* Snapshot at the start of a wait, so the log below can say
+                 * what actually moved: the clock, the frame, or neither.
+                 *
+                 * Keyed on the snapshot being unset rather than on hold == 0
+                 * -- switch_to sets hold to 1, never 0, so the old condition
+                 * never fired and the figures logged were raw clock values
+                 * rather than deltas. Cleared on every successful present
+                 * below, so it marks "a wait is in progress". */
+                P.wait_start_clock = now ? now : 1;
+                P.wait_start_pts   = 0;
+                for (int i = 0; i < NUM_FRAMES; i++)
+                    if (__atomic_load_n(&P.frames[i].state,
+                                        __ATOMIC_ACQUIRE) == SLOT_READY
+                        && P.frames[i].index > P.shown_index
+                        && (!P.wait_start_pts
+                            || P.frames[i].pts_us < P.wait_start_pts))
+                        P.wait_start_pts = P.frames[i].pts_us;
+            }
+            P.hold++;
+            P.repeats++;
+
+            /* How long to wait depends on whether the clock is alive.
+             *
+             * If it is advancing, waiting is right and correct: the frame
+             * becomes due shortly and sync is preserved exactly. If it has
+             * stopped, waiting is pointless -- a stopped clock never
+             * reaches the next timestamp, however long you give it.
+             *
+             * A clock that has not moved since the last frame was shown is
+             * treated as stopped, and the picture is paced from the stream's
+             * own frame rate instead. That plays at normal speed rather than
+             * the two frames per second a fixed floor would give, and it
+             * costs only sync accuracy -- which is already lost while the
+             * reference is frozen, and is recovered the moment it moves
+             * again. */
+            {
+                int64_t now2 = audio_clock_us();
+                int  wait = DIRECT_MAX_WAIT;
+
+                /* "Has the clock moved?" cannot be an equality test on a
+                 * microsecond value -- the phase-locked loop nudges it by a
+                 * few microseconds even while it is frozen, so an exact
+                 * comparison practically never holds. Treat anything under
+                 * half a frame of movement as stopped. */
+                int64_t moved = now2 - P.last_present_clock;
+                long half  = 500000L / (P.fps_milli ? P.fps_milli / 1000 : 24);
+
+                if (P.last_present_clock && moved < half && moved > -half) {
+                    /* Clock stopped. Waiting cannot help -- a stopped clock
+                     * never reaches the next timestamp -- so pace from the
+                     * stream's own frame rate to keep the picture moving. */
+                    long per_frame = refresh_due(1);
+                    wait = (int)(per_frame > 0 ? per_frame : 2);
+                } else {
+                    /* Clock is alive, so waiting is exactly the right thing
+                     * and it WILL end: the picture is ahead, the clock is
+                     * advancing towards it, and when it arrives the frame is
+                     * presented in sync.
+                     *
+                     * The short floor must not apply here. It did, and it
+                     * defeated the only mechanism that closes this gap:
+                     * half a second of correct waiting was cut short by
+                     * showing a frame from 700ms in the future, pushing the
+                     * picture further ahead of the sound instead of letting
+                     * the sound reach it. The gap then never closed --
+                     * direct mode stayed engaged for nine minutes.
+                     *
+                     * DIRECT_MAX_WAIT still applies as a backstop, at a
+                     * length no legitimate wait reaches, in case the clock
+                     * stalls in some way the check above does not catch. */
+                    wait = DIRECT_MAX_WAIT;
+                }
+
+                if (P.hold > wait) {
+                int oldest = -1;
+                for (int i = 0; i < NUM_FRAMES; i++) {
+                    if (__atomic_load_n(&P.frames[i].state,
+                                        __ATOMIC_ACQUIRE) != SLOT_READY)
+                        continue;
+                    if (P.frames[i].index <= P.shown_index)
+                        continue;
+                    if (oldest < 0
+                        || P.frames[i].index < P.frames[oldest].index)
+                        oldest = i;
+                }
+                if (oldest >= 0) {
+                    if (!P.early_logged) {
+                        vs_log("nothing due for %d refreshes -- advancing "
+                               "anyway (frame %ld, %ld ms early). "
+                               "clock now %lds%03ldms, was %lds%03ldms. "
+                               "frame pts %lds%03ldms, oldest ready idx %ld, "
+                               "shown idx %ld, ready=%d",
+                               P.hold, P.frames[oldest].index,
+                               (long)((P.frames[oldest].pts_us - now2) / 1000),
+                               (long)(now2 / 1000000),
+                               (long)((now2 / 1000) % 1000),
+                               (long)(P.wait_start_clock / 1000000),
+                               (long)((P.wait_start_clock / 1000) % 1000),
+                               (long)(P.frames[oldest].pts_us / 1000000),
+                               (long)((P.frames[oldest].pts_us / 1000) % 1000),
+                               P.frames[oldest].index, P.shown_index,
+                               ready_count());
+                        P.early_logged = 1;
+                    }
+                    release_older_than(P.frames[oldest].index);
+                    switch_to(oldest);      /* resets P.hold */
+                    P.last_present_clock = now2;
+                    P.wait_start_clock   = 0;
+                }
+                }
+            }
+            return;
+        }
+
+        P.early_logged = 0;
+
+        {
+            int64_t err = now - P.frames[best].pts_us;
+
+            release_older_than(P.frames[best].index);
+            switch_to(best);
+            P.last_present_clock = now;
+            P.wait_start_clock   = 0;      /* no wait in progress */
+
+            if (err < DIRECT_EXIT_US && err > -DIRECT_EXIT_US) {
+                if (++P.direct_ok > 30) {          /* ~half a second steady */
+                    /* Hand back cleanly: anchor so the schedule's next due
+                     * frame is the one just shown, and re-seed the filter so
+                     * it does not average across the handover. */
+                    P.anchor        = P.vsync_n - refresh_due(P.shown_index);
+                    P.direct_mode   = 0;
+                    P.direct_ok     = 0;
+                    P.av_valid      = 0;
+                    rate_reset();
+                    vs_log("sync recovered (%ld ms), back to display pacing",
+                           (long)(err / 1000));
+                }
+            } else {
+                P.direct_ok = 0;
+            }
+        }
+        return;
+    }
 
     /* Bootstrap: align the vsync schedule to the audio clock.
      *
@@ -1499,8 +1864,9 @@ void vs_play_present(void)
      * the schedule then free-runs off the vsync counter, that offset never
      * goes away. Anchor against the audio clock instead. */
     if (P.cur_slot < 0) {
-        int  best = -1;
-        long now, lead_refreshes;
+        int     best = -1;
+        int64_t now;
+        long    lead_refreshes;
 
         /* Wait for audio to be sounding AND for the clock filter to settle.
          *
@@ -1527,10 +1893,10 @@ void vs_play_present(void)
         now = audio_clock_us();
         {
             long period_us = (long)(1000000000000LL / P.hz_micro);
-            long err       = now - P.frames[best].pts_us;
-            lead_refreshes = (err >= 0)
+            int64_t err       = now - P.frames[best].pts_us;
+            lead_refreshes = (long)((err >= 0)
                              ? (err + period_us / 2) / period_us
-                             : (err - period_us / 2) / period_us;
+                             : (err - period_us / 2) / period_us);
         }
 
         P.anchor = P.vsync_n - refresh_due(P.frames[best].index)
@@ -1539,8 +1905,9 @@ void vs_play_present(void)
         P.av_valid = 0;                    /* filter must re-seed after a jump */
         rate_reset();                      /* and the window must not span it */
         vs_log("A/V anchored: frame %ld pts %ld, clock %ld, offset %ld ms",
-               P.frames[best].index, P.frames[best].pts_us, now,
-               (now - P.frames[best].pts_us) / 1000);
+               P.frames[best].index, (long)(P.frames[best].pts_us / 1000),
+               (long)(now / 1000),
+               (long)((now - P.frames[best].pts_us) / 1000));
         switch_to(best);
         return;
     }
@@ -1580,7 +1947,7 @@ void vs_play_present(void)
          * keeps the picture moving in sync with the sound regardless of
          * why. */
         if (P.clock_locked && P.hold > 8) {
-            long now  = audio_clock_us();
+            int64_t now  = audio_clock_us();
             int  late = -1;
 
             for (int i = 0; i < NUM_FRAMES; i++) {
@@ -1602,7 +1969,7 @@ void vs_play_present(void)
                     vs_log("backstop: schedule not advancing, presenting "
                            "frame %ld directly (%ld ms late)",
                            P.frames[late].index,
-                           (now - P.frames[late].pts_us) / 1000);
+                           (long)((now - P.frames[late].pts_us) / 1000));
                     P.backstop_fired = 1;
                 }
                 /* Re-anchor so the normal schedule resumes from here
@@ -1655,13 +2022,32 @@ void vs_play_present(void)
          *
          * Gated on a READY frame existing so it can never fire during a
          * legitimate wait for data -- with nothing decoded there is nothing
-         * to re-anchor to, and holding is the correct behaviour. */
+         * to re-anchor to, and holding is the correct behaviour.
+         *
+         * Gated ALSO on that frame being genuinely late. A hold is not
+         * always a fault: when the audio stream is starved, the clock is
+         * held still on purpose and video is supposed to wait for it. This
+         * fired anyway, decided a stuck schedule was to blame, and
+         * re-anchored to the newest decoded frame -- pushing the picture
+         * forward past sound that had not played yet. The correction would
+         * hold video back, the watchdog would shove it forward again two
+         * seconds later, and the gap grew every cycle: logs show it
+         * reaching three minutes, widening at about half of real time, with
+         * the audio underrunning throughout.
+         *
+         * So: only intervene when frames are LATE. A frame whose timestamp
+         * is still in the future is not evidence of anything being stuck,
+         * and waiting for it is the whole job. */
         if (P.hold > 120) {
-            int newest = -1;
+            int  newest = -1;
+            int64_t now    = P.clock_locked ? audio_clock_us() : 0;
+
             for (int i = 0; i < NUM_FRAMES; i++) {
                 if (__atomic_load_n(&P.frames[i].state,
                                     __ATOMIC_ACQUIRE) != SLOT_READY)
                     continue;
+                if (P.clock_locked && now < P.frames[i].pts_us)
+                    continue;               /* not due yet; waiting is right */
                 if (newest < 0 || P.frames[i].index > P.frames[newest].index)
                     newest = i;
             }
@@ -1680,11 +2066,10 @@ void vs_play_present(void)
                  * Same arithmetic as the bootstrap anchor: work out how
                  * many refreshes this frame is late by against the clock,
                  * and offset the anchor by that. */
-                long now  = audio_clock_us();
                 long per  = (long)(1000000000000LL / P.hz_micro);
-                long err  = now - P.frames[newest].pts_us;
-                long lead = (err >= 0) ? (err + per / 2) / per
-                                       : (err - per / 2) / per;
+                int64_t err  = now - P.frames[newest].pts_us;
+                long lead = (long)((err >= 0) ? (err + per / 2) / per
+                                              : (err - per / 2) / per);
 
                 /* CLAMP. Compensating for a large deficit moves the
                  * schedule past everything that has been decoded, so
@@ -1712,7 +2097,7 @@ void vs_play_present(void)
                     vs_log("LARGE A/V GAP: picture %ld ms %s sound at frame "
                            "%ld. Too large for the schedule to absorb -- "
                            "%s is not keeping up.",
-                           (err > 0 ? err : -err) / 1000,
+                           (long)((err > 0 ? err : -err) / 1000),
                            err > 0 ? "behind" : "ahead of",
                            P.frames[newest].index,
                            err > 0 ? "video (source, network or encoder)"
@@ -1720,7 +2105,8 @@ void vs_play_present(void)
                 else
                     vs_log("schedule stuck at v_rel=%ld after %d refreshes; "
                            "re-anchoring to frame %ld (%ld ms from audio)",
-                           v_rel, P.hold, P.frames[newest].index, err / 1000);
+                           v_rel, P.hold, P.frames[newest].index,
+                           (long)(err / 1000));
 
                 P.last_watchdog_vsync = P.vsync_n;
                 P.anchor = P.vsync_n - refresh_due(P.frames[newest].index)
@@ -1796,7 +2182,7 @@ void vs_play_present(void)
      * second. That is slow enough that the cadence stays regular while still
      * pulling A/V back together within a few seconds. */
     {
-        long raw = P.frames[slot].pts_us - audio_clock_us();
+        int64_t raw = P.frames[slot].pts_us - audio_clock_us();
 
         if (!P.av_valid) {                 /* seed, don't ramp from zero */
             P.av_offset_us = raw;
@@ -1817,6 +2203,29 @@ void vs_play_present(void)
         drift = P.av_offset_us - P.av_trim_us;
     }
 
+    /* Trace the drift while it is still small.
+     *
+     * Every diagnostic so far has fired only once the error was already
+     * large, which shows the aftermath and not the cause. This reports the
+     * error and the correction activity once a second whenever it is beyond
+     * the nudge threshold but below the point where direct mode takes over
+     * -- the window in which the error grows from nothing to a problem.
+     *
+     * The nudge is worth 16.7ms per second, so an error that climbs through
+     * this band means either the nudge is not firing, or something is
+     * injecting error faster than it can remove it. The counter says which. */
+    if ((drift > AV_CORRECT_US || drift < -AV_CORRECT_US)
+        && P.vsync_n - P.last_trace_vsync > 60) {
+        P.last_trace_vsync = P.vsync_n;
+        vs_log("drift %ld ms (picture %s), corrections %ld, direct=%d, "
+               "hz %ld.%04ld, shown %ld",
+               (long)((drift > 0 ? drift : -drift) / 1000),
+               drift > 0 ? "ahead" : "behind",
+               P.resyncs, P.direct_mode,
+               P.hz_micro / 1000000, (P.hz_micro % 1000000) / 100,
+               P.shown_index);
+    }
+
     /* Nothing to correct while buffering.
      *
      * The clock is deliberately held still across a stall, so the offset
@@ -1826,52 +2235,39 @@ void vs_play_present(void)
      * about to vanish on its own the moment the clock restarts. */
     if (P.buffering) return;
 
-    /* One refresh per correction, at most once per second, while the error
-     * is small: slow enough that the cadence stays regular, fast enough to
-     * close a visible gap in a few seconds. Past AV_SNAP_US it corrects the
-     * whole error at once instead -- see below. */
+    /* One refresh per correction, at most once per second: slow enough that
+     * the cadence stays regular, fast enough to close a visible gap in a few
+     * seconds. This handles small errors only -- anything large goes to
+     * direct mode, which is the one thing here that provably converges. */
     if ((drift > AV_CORRECT_US || drift < -AV_CORRECT_US) &&
         P.vsync_n - P.last_correct_vsync > 60) {
         long period_us = (long)(1000000000000LL / P.hz_micro);
-        long steps     = 1;
         int  big       = (drift > AV_SNAP_US || drift < -AV_SNAP_US);
 
-        /* Correct in PROPORTION to the error, not one refresh at a time.
+        /* A large gap is handed to direct mode rather than corrected here.
          *
-         * A single refresh per second is 16.7ms/s of authority -- enough for
-         * the tens of milliseconds this loop was built for, and nothing
-         * larger. After two seconds of buffering the offset is hundreds of
-         * milliseconds, which at that rate takes half a minute, and if the
-         * rate estimate is even slightly off it grows faster than the
-         * correction removes it.
+         * Nudging the anchor cannot close it. The target only counts upward
+         * from shown_index, so a backwards anchor move cannot rewind the
+         * picture -- it only makes the schedule wait, and the error is
+         * re-measured long before the wait plays out. The result was the
+         * same correction firing every few seconds against an error that
+         * never moved.
          *
-         * A snap takes the whole error out in one move instead. But ONE
-         * move: a snap needs seconds to actually play out, because it works
-         * by moving the schedule and letting the refresh count catch up.
-         * Re-measuring a second later shows the error still there, snapping
-         * again, and again -- which does not correct anything, it just
-         * re-presents once a second. That is 1fps video with the sound
-         * running normally, and it is exactly what happened before this
-         * cooldown existed. */
-        if (big && P.vsync_n - P.last_snap_vsync < AV_SNAP_COOLDOWN)
-            return;
-
+         * Direct mode closes the loop instead: it presents against the
+         * clock every refresh and hands back once the error is small. */
         if (big) {
-            long mag = (drift > 0) ? drift : -drift;
-            steps = (mag + period_us / 2) / period_us;
-            if (steps < 1) steps = 1;
-            vs_log("sync snap: picture %ld ms %s sound, correcting %ld "
-                   "refreshes at once", mag / 1000,
-                   drift > 0 ? "ahead of" : "behind", steps);
-            P.last_snap_vsync = P.vsync_n;
-            /* A jump this size must not be averaged across by the filter,
-             * and the baseline shift below cannot represent it honestly
-             * either -- so re-seed both rather than distort them. */
-            P.av_valid = 0;
-            rate_reset();
+            if (!P.direct_mode) {
+                vs_log("sync %ld ms out (picture %s sound) -- switching to "
+                       "clock pacing until it closes",
+                       (long)((drift > 0 ? drift : -drift) / 1000),
+                       drift > 0 ? "ahead of" : "behind");
+                P.direct_mode = 1;
+                P.direct_ok   = 0;
+            }
+            return;
         }
 
-        P.anchor += (drift > 0) ? steps : -steps;
+        P.anchor += (drift > 0) ? 1 : -1;
         P.last_correct_vsync = P.vsync_n;
         P.resyncs++;
 
@@ -1883,8 +2279,8 @@ void vs_play_present(void)
          * instead (what this did before) capped the baseline at the gap
          * between corrections, and slope accuracy scales with baseline
          * length. */
-        P.av_offset_us += (drift > 0) ? -period_us * steps : period_us * steps;
-        P.rate_av0     += (drift > 0) ? -period_us * steps : period_us * steps;
+        P.av_offset_us += (drift > 0) ? -period_us : period_us;
+        P.rate_av0     += (drift > 0) ? -period_us : period_us;
     }
 }
 
@@ -1902,9 +2298,18 @@ void vs_play_set_paused(int paused)
     if (paused) {
         P.pause_started = sceKernelGetProcessTimeWide();
     } else if (P.pause_started) {
-        P.pause_accum_us += (long)(sceKernelGetProcessTimeWide()
+        P.pause_accum_us += (int64_t)(sceKernelGetProcessTimeWide()
                                    - P.pause_started);
         P.pause_started = 0;
+
+        /* Resume with a clean slate for anything that measures elapsed
+         * presentation time. Whatever these held was accumulated before the
+         * pause and says nothing about the state now -- carrying it across
+         * made the first frame after a resume look overdue. */
+        P.hold             = 1;
+        P.wait_start_clock = 0;
+        P.early_logged     = 0;
+        P.last_present_clock = 0;
     }
     P.paused = paused;
     vs_log("%s", paused ? "paused" : "resumed");
@@ -1917,7 +2322,7 @@ long vs_play_duration_s(void) { return P.duration_s; }
 /* Nudge the sync target. Positive moves picture later relative to sound. */
 void vs_play_trim(int delta_us)
 {
-    long t = P.av_trim_us + delta_us;
+    int64_t t = P.av_trim_us + delta_us;
 
     /* Wide clamp on purpose.
      *
@@ -1971,7 +2376,7 @@ void vs_play_stats(vs_play_stat *st)
 
 int vs_play_running(void) { return P.running; }
 
-long vs_play_position_s(void) { return audio_clock_us() / 1000000; }
+long vs_play_position_s(void) { return (long)(audio_clock_us() / 1000000); }
 
 /* Safe to call twice, and safe after a failed vs_play_start.
  *

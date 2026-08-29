@@ -406,6 +406,9 @@ typedef struct {
 static ep_t g_eps[MAX_EPISODES];
 static int  g_ep_count, g_ep_sel, g_ep_scroll;
 static char g_meta_name[128];    /* series title, for the episode header */
+static vita2d_texture *g_backdrop;  /* loading-screen artwork, may be NULL */
+static char g_meta_bg[1024];     /* backdrop URL, for the loading screen  */
+static char g_meta_logo[1024];   /* transparent title treatment, optional */
 static int  g_meta_row_n;        /* 0 while the header row is pending */
 
 /* id the current stream list was fetched for -- the movie id from the
@@ -487,6 +490,11 @@ static void on_meta_row(char **f, int n)
     if (n < 4) return;
     if (g_meta_row_n++ == 0) {
         snprintf(g_meta_name, sizeof(g_meta_name), "%s", f[0]);
+        /* Fields 4 and 5 are the backdrop and logo, appended by newer
+         * middleware. Guarded on n so an older server -- which sends four
+         * fields -- still works, just without artwork. */
+        if (n >= 5) snprintf(g_meta_bg, sizeof(g_meta_bg), "%s", f[4]);
+        if (n >= 6) snprintf(g_meta_logo, sizeof(g_meta_logo), "%s", f[5]);
         return;
     }
     if (g_ep_count >= MAX_EPISODES) return;
@@ -597,7 +605,7 @@ static void on_stream_row(char **f, int n)
 
 enum { JOB_IDLE = 0, JOB_REQUESTED = 1, JOB_DONE = 2 };
 enum { WORK_NONE, WORK_CATALOG, WORK_STREAMS, WORK_POSTER, WORK_SYNC,
-       WORK_SUBTRACKS, WORK_SUBS, WORK_AUDTRACKS, WORK_META };
+       WORK_SUBTRACKS, WORK_SUBS, WORK_AUDTRACKS, WORK_META, WORK_BACKDROP };
 
 
 static volatile int  g_job_state = JOB_IDLE;
@@ -955,6 +963,16 @@ static void job_collect(void)
         g_ep_count = g_ep_sel = g_ep_scroll = 0;
         g_meta_row_n   = 0;
         g_meta_name[0] = 0;
+        g_meta_bg[0]   = 0;
+        g_meta_logo[0] = 0;
+        /* The artwork belongs to the title that just went away. Freed here
+         * rather than on stop_playback so that backing out to try a
+         * different source keeps it -- that is the same title, and
+         * refetching would show a blank loading screen for no reason. */
+        if (g_backdrop) {
+            vita2d_free_texture(g_backdrop);
+            g_backdrop = NULL;
+        }
         if (!g_job_result) {
             snprintf(g_status, sizeof(g_status), "episode lookup failed");
         } else {
@@ -1015,6 +1033,19 @@ static void job_collect(void)
         } else {
             snprintf(g_status, sizeof(g_status), "no account linked");
         }
+        break;
+
+    case WORK_BACKDROP:
+        /* Full-screen artwork for the loading screen. Fetched once per
+         * title, only when a source is chosen -- not eagerly for the whole
+         * catalogue, which would put every backdrop behind every poster in
+         * the same single-worker queue and make the grid crawl. */
+        if (g_backdrop) {
+            vita2d_free_texture(g_backdrop);
+            g_backdrop = NULL;
+        }
+        if (g_job_result && g_job_len > 128)
+            g_backdrop = vita2d_load_JPEG_buffer(g_job_result, g_job_len);
         break;
 
     case WORK_POSTER:
@@ -1908,8 +1939,64 @@ static void draw_prim_stats(void)
     ui_text(26, 29, b > VITA2D_POOL_BYTES / 2 ? C_ACCENT : C_TEXT, 0.80f, l);
 }
 
+/* The screen shown between pressing play and the first frame arriving.
+ *
+ * That gap is the buffer filling -- around a second and a half now that the
+ * audio prebuffer is deeper -- and it used to be plain black, which is
+ * indistinguishable from the app having hung. Showing the backdrop and the
+ * title makes the wait legible: you can see what is starting and that
+ * something is happening.
+ *
+ * Everything here is optional. No artwork gives a plain dark screen with
+ * the title; no title gives just the spinner. It never blocks playback. */
+static void draw_loading(void)
+{
+    const char *title = g_meta_name[0] ? g_meta_name
+                      : (g_sel < g_item_count ? g_items[g_sel].name : "");
+    int i;
+
+    if (g_backdrop) {
+        vita2d_draw_texture(g_backdrop, 0, 0);
+        /* Dim it heavily. It is a backdrop, not the subject -- the title
+         * and the spinner have to stay legible over whatever the image
+         * happens to be. */
+        vita2d_draw_rectangle(0, 0, 960, 544, RGBA8(0x0C, 0x0A, 0x14, 0xC4));
+    } else {
+        vita2d_draw_rectangle(0, 0, 960, 544, C_BG);
+    }
+
+    if (title && title[0]) {
+        int w = vita2d_pgf_text_width(g_font, 1.15f, title);
+        ui_text((960 - w) / 2, 250, C_TEXT, 1.15f, title);
+    }
+
+    /* Same ring as the buffering indicator, so a wait looks like a wait
+     * wherever it happens. */
+    {
+        static int spin;
+        const float cx = 480.0f, cy = 320.0f, rad = 22.0f;
+        const int   N = 24;
+        int head = (spin++ / 2) % N;
+
+        for (i = 0; i < N; i++) {
+            int   back = (head - i + N) % N;
+            float t    = 1.0f - (float)back / (float)N;
+            float a    = (float)i * (6.2831853f / (float)N);
+            unsigned char al = (unsigned char)(40.0f + 215.0f * t * t);
+            vita2d_draw_fill_circle(cx + rad * cosf(a), cy + rad * sinf(a),
+                                    2.2f, RGBA8(0x7B, 0x5C, 0xFF, al));
+        }
+    }
+}
+
 static void draw_playing(void)
 {
+    /* Nothing decoded yet means the buffer is still filling. */
+    if (vs_play_presented() == 0) {
+        draw_loading();
+        return;
+    }
+
     vs_play_draw();
     if (g_subtrack_sel >= 0) draw_subtitle();
 
@@ -2145,6 +2232,17 @@ static void handle_streams(unsigned int pressed)
 
     if ((pressed & SCE_CTRL_CROSS) && g_stream_count > 0) {
         int resume = resume_point(g_cur_id);
+
+        /* Ask for the backdrop now, so the loading screen has something to
+         * show while the buffer fills. Fire-and-forget: if the worker is
+         * busy or the title has no artwork, the loading screen falls back
+         * to plain text and nothing is delayed waiting for it. */
+        if (g_meta_bg[0] && !g_backdrop) {
+            char esc[900], path[900];
+            urlesc(g_meta_bg, esc, sizeof(esc));
+            snprintf(path, sizeof(path), "/art?u=%s&w=960&h=544", esc);
+            job_submit(WORK_BACKDROP, path, 0);
+        }
 
         vs_play_set_content_id(g_cur_id);
         g_seek_base = resume;
